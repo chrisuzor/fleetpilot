@@ -340,7 +340,7 @@ Unit tests use an in-memory queue, an in-memory lock, an in-memory audit log, an
 go test -race ./...
 ```
 
-GitHub Actions runs that command on every push. The job does not start PostgreSQL. `docker compose up --build` is how you run the Postgres path, including the row lock.
+GitHub Actions runs that command on every push. The job does not start PostgreSQL. `docker compose up --build` is how you run the Postgres path, including the row lock. A second job runs `tofu validate` for `deploy/tofu`. It does not apply, and it does not start a cluster.
 
 ## Configuration
 
@@ -354,9 +354,39 @@ GitHub Actions runs that command on every push. The job does not start PostgreSQ
 
 Compose sets `DATABASE_URL` and `PORT`. It does not set the trace variables, so spans go to stdout and no collector is required. There is no provider switch. The process always uses the fake provider. The worker runs with four in-flight jobs, five attempts, a 100ms base delay, a 5s cap, and a 50ms poll.
 
-## Not in this slice
+## Kubernetes
 
-Kubernetes and Terraform are intentionally absent. The role header is not an identity provider. Traces are not exported to a collector.
+The manifests in `deploy/kubernetes/` run two workloads in the `fleetpilot` namespace:
+
+- PostgreSQL 16, with the same local database name, user, and password as Compose. Desired state, jobs, health checks, rollouts, and the audit log live there. The service is ClusterIP, so Postgres is not published outside the cluster. The volume uses the cluster's default StorageClass.
+- One API replica, image `fleetpilot:local`, still on the in-process fake provider. Actual instances exist only in that process, so the deployment does not scale past one replica and does not create a virtual machine. The API service is ClusterIP.
+
+The database user and password are both `fleetpilot`. That is the local Compose default, not a deployed credential. The manifests do not use a Kubernetes Secret or a cloud secret store. The API image is not pulled from a registry.
+
+Apply is local and optional. Compose remains the way to run the stack. GitHub Actions validates the OpenTofu module and does not apply these manifests.
+
+```bash
+docker build -t fleetpilot:local .
+# Load fleetpilot:local into the local cluster, then:
+kubectl apply -f deploy/kubernetes/
+kubectl -n fleetpilot port-forward svc/api 8080:8080
+```
+
+`port-forward` listens on localhost. For kind, load the image with `kind load docker-image fleetpilot:local`. For minikube, use `minikube image load fleetpilot:local`.
+
+OpenTofu in `deploy/tofu/` describes those same manifests. Validate does not need a kubeconfig, cloud credentials, or a cluster:
+
+```bash
+cd deploy/tofu
+tofu init -backend=false -input=false
+tofu validate
+```
+
+`tofu apply` is optional and only for a cluster you already have locally. The module has no remote backend. It does not create a cluster, a load balancer, or a virtual machine.
+
+## Still out
+
+Cloud accounts and real virtual machines stay out. The role header is not an identity provider. Traces are not exported to a collector.
 
 ## License
 

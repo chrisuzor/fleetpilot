@@ -1,0 +1,7 @@
+# Local namespace for the API and Postgres. Apply is optional.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fleetpilot
+  labels:
+    app.kubernetes.io/name: fleetpilot

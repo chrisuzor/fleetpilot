@@ -4,3 +4,8 @@
 bin/
 coverage.out
 *.exe
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log

@@ -1,0 +1,53 @@
+# One API replica. Actual instances live in this process, on the fake provider.
+# The image is built locally and is not pulled from a registry.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: fleetpilot
+  labels:
+    app.kubernetes.io/name: fleetpilot
+    app.kubernetes.io/component: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fleetpilot
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fleetpilot
+        app.kubernetes.io/component: api
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: api
+          image: fleetpilot:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: DATABASE_URL
+              value: postgres://fleetpilot:fleetpilot@postgres:5432/fleetpilot?sslmode=disable
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi

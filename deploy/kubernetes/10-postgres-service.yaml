@@ -1,0 +1,17 @@
+# ClusterIP only. Postgres is not published outside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: fleetpilot
+  labels:
+    app.kubernetes.io/name: fleetpilot
+    app.kubernetes.io/component: postgres
+spec:
+  selector:
+    app.kubernetes.io/name: fleetpilot
+    app.kubernetes.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

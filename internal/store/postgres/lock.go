@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 
@@ -34,7 +35,12 @@ func (s *Store) WithLock(ctx context.Context, instanceName string, fn func(conte
 	if err != nil {
 		return fmt.Errorf("begin instance lock: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		err := tx.Rollback(ctx)
+		if err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			slog.Error("rollback instance lock", "err", err)
+		}
+	}()
 
 	if _, err = tx.Exec(ctx, insertInstanceLockSQL, instanceName); err != nil {
 		return fmt.Errorf("insert instance lock: %w", err)

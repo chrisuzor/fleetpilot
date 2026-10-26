@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -22,7 +23,12 @@ func (s *Store) Enqueue(ctx context.Context, in work.Job) (work.Job, bool, error
 	if err != nil {
 		return work.Job{}, false, fmt.Errorf("begin enqueue: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		err := tx.Rollback(ctx)
+		if err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			slog.Error("rollback job transaction", "err", err)
+		}
+	}()
 
 	existing, found, err := lockActiveJob(ctx, tx, in.Name)
 	if err != nil {

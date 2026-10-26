@@ -340,7 +340,7 @@ Unit tests use an in-memory queue, an in-memory lock, an in-memory audit log, an
 go test -race ./...
 ```
 
-GitHub Actions runs that command on every push. The job does not start PostgreSQL. `docker compose up --build` is how you run the Postgres path, including the row lock. A second job runs `tofu validate` for `deploy/tofu`. It does not apply, and it does not start a cluster.
+GitHub Actions runs that command, `golangci-lint`, and `docker build -t fleetpilot:local .` on every push. The image is not pushed to a registry. The test job does not start PostgreSQL. `docker compose up --build` is how you run the Postgres path, including the row lock. Another job runs `tofu validate` for `deploy/tofu`. It does not apply, and it does not start a cluster.
 
 ## Configuration
 

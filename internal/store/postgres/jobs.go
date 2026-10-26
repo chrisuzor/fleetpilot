@@ -14,7 +14,7 @@ import (
 
 var _ work.Queue = (*Store)(nil)
 
-const jobColumns = `id, instance_name, op, image, size, region, provider_id, attempts, status, run_after, last_error, created_at, updated_at`
+const jobColumns = `id, instance_name, op, image, size, region, provider_id, attempts, status, run_after, last_error, created_at, updated_at, trace_parent`
 
 // Enqueue inserts a job or refreshes the pending job for that instance.
 func (s *Store) Enqueue(ctx context.Context, in work.Job) (work.Job, bool, error) {
@@ -42,9 +42,10 @@ func (s *Store) Enqueue(ctx context.Context, in work.Job) (work.Job, bool, error
 		row := tx.QueryRow(ctx, `
 			UPDATE jobs
 			SET op = $2, image = $3, size = $4, region = $5, provider_id = $6,
-			    attempts = 0, last_error = '', run_after = $7, updated_at = $7
+			    attempts = 0, last_error = '', run_after = $7, updated_at = $7,
+			    trace_parent = $8
 			WHERE id = $1 AND status = 'pending'
-			RETURNING `+jobColumns, existing.ID, in.Op, in.Spec.Image, in.Spec.Size, in.Spec.Region, in.ProviderID, now)
+			RETURNING `+jobColumns, existing.ID, in.Op, in.Spec.Image, in.Spec.Size, in.Spec.Region, in.ProviderID, now, in.TraceParent)
 		updated, err := scanJob(row)
 		if err != nil {
 			return work.Job{}, false, fmt.Errorf("update job: %w", err)
@@ -67,15 +68,15 @@ func (s *Store) Enqueue(ctx context.Context, in work.Job) (work.Job, bool, error
 	row := tx.QueryRow(ctx, `
 		INSERT INTO jobs (
 			id, instance_name, op, image, size, region, provider_id,
-			status, attempts, run_after, last_error, created_at, updated_at
+			status, attempts, run_after, last_error, created_at, updated_at, trace_parent
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7,
-			'pending', 0, $8, '', $9, $9
+			'pending', 0, $8, '', $9, $9, $10
 		)
 		ON CONFLICT (instance_name) WHERE status IN ('pending', 'running') DO NOTHING
 		RETURNING `+jobColumns,
 		in.ID, in.Name, in.Op, in.Spec.Image, in.Spec.Size, in.Spec.Region, in.ProviderID,
-		in.RunAfter, now)
+		in.RunAfter, now, in.TraceParent)
 	inserted, err := scanJob(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing, found, err = lockActiveJob(ctx, tx, in.Name)
@@ -118,7 +119,7 @@ func (s *Store) Claim(ctx context.Context, now time.Time) (work.Job, bool, error
 		WHERE jobs.id = next.id
 		RETURNING jobs.id, jobs.instance_name, jobs.op, jobs.image, jobs.size, jobs.region,
 		          jobs.provider_id, jobs.attempts, jobs.status, jobs.run_after, jobs.last_error,
-		          jobs.created_at, jobs.updated_at`, now, staleBefore)
+		          jobs.created_at, jobs.updated_at, jobs.trace_parent`, now, staleBefore)
 	job, err := scanJob(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return work.Job{}, false, nil
@@ -247,6 +248,7 @@ func scanJob(row scannable) (work.Job, error) {
 		&job.LastError,
 		&job.CreatedAt,
 		&job.UpdatedAt,
+		&job.TraceParent,
 	)
 	return job, err
 }

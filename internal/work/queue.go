@@ -48,6 +48,7 @@ func (q *MemoryQueue) Enqueue(ctx context.Context, in Job) (Job, bool, error) {
 		job.Op = in.Op
 		job.Spec = in.Spec
 		job.ProviderID = in.ProviderID
+		job.TraceParent = in.TraceParent
 		job.Attempts = 0
 		job.LastError = ""
 		job.RunAfter = now

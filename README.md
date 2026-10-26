@@ -39,6 +39,8 @@ A second reconcile with no spec change enqueues nothing and returns `{"jobs":[]}
 
 The API process starts a worker. The worker claims a ready job, takes the instance lock, and applies it. At most four jobs are in flight in one process.
 
+`GET /metrics` counts HTTP requests, reconcile runs, job outcomes, and in-flight jobs. A reconcile request and the worker that applies its job share a trace. With the default settings those spans are written to stdout.
+
 Names are unique and immutable. Rename by deleting the desired instance and creating a new one.
 
 Image, size, and region are labels. The fake provider stores them. It does not boot a machine.
@@ -288,6 +290,16 @@ curl -sS -X POST http://127.0.0.1:8080/v1/rollouts \
 
 `GET /v1/rollouts/roll_0123456789abcdef` with `X-FleetPilot-Role: operator` returns the same shape. The response above is the paused rollout. The create response is `running` until the roller finishes the checks.
 
+Scrape metrics. This route does not read `X-FleetPilot-Role`. Keep the API on localhost.
+
+```bash
+curl -sS http://127.0.0.1:8080/metrics
+```
+
+The series are `fleetpilot_http_requests_total` (`method`, `path`, `code`), `fleetpilot_reconcile_runs_total` (`result` `ok` or `error`), `fleetpilot_job_outcomes_total` (`outcome` `succeeded` or `dead`), and `fleetpilot_jobs_in_flight`. A retry or a released lock is not an outcome. The HTTP path label is the route pattern, so instance ids stay out of the series.
+
+A `POST /v1/reconcile` records a span named `reconcile`. The worker records `job.apply` on the same trace. The job row stores the W3C `traceparent` for that link. It is not part of the job JSON.
+
 Read the audit log. A reader can do this. The newest row is first.
 
 ```bash
@@ -316,11 +328,13 @@ The fake provider is the point. FleetPilot's job is to remember desired state an
 
 The cost is that this does not provision real infrastructure. Quotas, cloud error shapes, and instance boot time are not exercised. Actual instances live only in the API process. Restarting the API clears them, including which names fail a health check. Desired rows, job history, health checks, and rollouts remain in PostgreSQL. The next reconcile enqueues creates for anything missing, and a new rollout reads health from the provider again. A later provider implements the same `Provider` interface. The reconciler still only enqueues, and the worker still applies.
 
-The role header is not authentication against an identity provider. Anyone who can reach the port can claim `operator`. That is acceptable here because the API stays on localhost and the header is a label, not a credential.
+The role header is not authentication against an identity provider. Anyone who can reach the port can claim `operator`. That is acceptable here because the API stays on localhost and the header is a label, not a credential. `/metrics` and `/healthz` do not read the header, for the same reason: the port stays on localhost.
+
+Stdout traces stay in the API process logs. They are not shipped to a collector. That keeps local development free of an extra process. A later exporter can replace the stdout writer without changing the spans.
 
 ## Tests
 
-Unit tests use an in-memory queue, an in-memory lock, an in-memory audit log, and the fake provider. They do not start PostgreSQL, Docker, or a cloud client. Requests in those tests send `X-FleetPilot-Role`. Failure-injection tests make the fake provider return an error. The job retries with the backoff above, then succeeds, or becomes `dead` on the fifth failure. A failed health check stops a rolling update. The module requires Go 1.25.
+Unit tests use an in-memory queue, an in-memory lock, an in-memory audit log, and the fake provider. They do not start PostgreSQL, Docker, a cloud client, or a trace collector. Requests in those tests send `X-FleetPilot-Role`, except `GET /metrics`. A succeeded job increases `fleetpilot_job_outcomes_total`. A reconcile request records a span in an in-memory exporter, and the worker span is a child of that span. Failure-injection tests make the fake provider return an error. The job retries with the backoff above, then succeeds, or becomes `dead` on the fifth failure. A failed health check stops a rolling update. The module requires Go 1.26.
 
 ```bash
 go test -race ./...
@@ -332,14 +346,17 @@ GitHub Actions runs that command on every push. The job does not start PostgreSQ
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | yes | | PostgreSQL URL for desired state, jobs, health checks, and rollouts |
+| `DATABASE_URL` | yes | | PostgreSQL URL for desired state, jobs, health checks, rollouts, and the audit log |
 | `PORT` | no | `8080` | API port |
+| `OTEL_SERVICE_NAME` | no | `fleetpilot` | `service.name` on exported spans |
+| `OTEL_TRACES_EXPORTER` | no | `console` | `console` or `stdout` writes spans to stdout. `none` turns tracing off. Any other value, including `otlp`, is ignored and still writes to stdout |
+| `OTEL_SDK_DISABLED` | no | | `true` or `1` turns tracing off |
 
-Compose sets both. There is no provider switch. The process always uses the fake provider. The worker runs with four in-flight jobs, five attempts, a 100ms base delay, a 5s cap, and a 50ms poll.
+Compose sets `DATABASE_URL` and `PORT`. It does not set the trace variables, so spans go to stdout and no collector is required. There is no provider switch. The process always uses the fake provider. The worker runs with four in-flight jobs, five attempts, a 100ms base delay, a 5s cap, and a 50ms poll.
 
 ## Not in this slice
 
-Kubernetes, Terraform, OpenTelemetry, and Prometheus are intentionally absent. The role header is not an identity provider.
+Kubernetes and Terraform are intentionally absent. The role header is not an identity provider. Traces are not exported to a collector.
 
 ## License
 

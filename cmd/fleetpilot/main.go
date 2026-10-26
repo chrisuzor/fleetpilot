@@ -15,6 +15,7 @@ import (
 	"github.com/chrisuzor/fleetpilot/internal/api"
 	"github.com/chrisuzor/fleetpilot/internal/provider/fake"
 	"github.com/chrisuzor/fleetpilot/internal/store/postgres"
+	"github.com/chrisuzor/fleetpilot/internal/telemetry"
 	"github.com/chrisuzor/fleetpilot/internal/work"
 )
 
@@ -38,6 +39,18 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTraces, err := telemetry.Setup(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := shutdownTraces(shutCtx); err != nil {
+			slog.Error("trace shutdown", "err", err)
+		}
+	}()
 
 	store, err := postgres.Connect(ctx, databaseURL)
 	if err != nil {

@@ -8,8 +8,15 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/chrisuzor/fleetpilot/internal/audit"
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
+	"github.com/chrisuzor/fleetpilot/internal/metrics"
+	"github.com/chrisuzor/fleetpilot/internal/telemetry"
 )
 
 // Worker claims jobs and applies them to a provider.
@@ -19,6 +26,8 @@ type Worker struct {
 	locker   Locker
 	cfg      Config
 	audit    audit.Log
+	metrics  *metrics.Metrics
+	tracer   trace.Tracer
 }
 
 // NewWorker returns a worker. Zero config fields use the defaults.
@@ -34,6 +43,23 @@ func NewWorker(queue Queue, provider fleet.Provider, locker Locker, cfg Config) 
 // SetAudit records job outcomes. A nil log leaves outcomes unrecorded.
 func (w *Worker) SetAudit(log audit.Log) {
 	w.audit = log
+}
+
+// SetMetrics counts terminal outcomes and in-flight applies. Nil ignores them.
+func (w *Worker) SetMetrics(m *metrics.Metrics) {
+	w.metrics = m
+}
+
+// SetTracer records the job.apply span. Call it before Run.
+func (w *Worker) SetTracer(tr trace.Tracer) {
+	w.tracer = tr
+}
+
+func (w *Worker) otelTracer() trace.Tracer {
+	if w.tracer != nil {
+		return w.tracer
+	}
+	return otel.Tracer(telemetry.TracerName)
 }
 
 // Run claims jobs until ctx is cancelled.
@@ -72,7 +98,7 @@ func (w *Worker) Run(ctx context.Context) {
 		go func(job Job) {
 			defer wg.Done()
 			defer func() { <-slots }()
-			w.finish(ctx, job)
+			w.applyClaimed(ctx, job)
 		}(job)
 	}
 }
@@ -84,11 +110,30 @@ func (w *Worker) Once(ctx context.Context) (bool, error) {
 	if err != nil || !ok {
 		return false, err
 	}
-	w.finish(ctx, job)
+	w.applyClaimed(ctx, job)
 	return true, nil
 }
 
+func (w *Worker) applyClaimed(ctx context.Context, job Job) {
+	if w.metrics != nil {
+		w.metrics.JobStarted()
+		defer w.metrics.JobFinished()
+	}
+	w.finish(ctx, job)
+}
+
 func (w *Worker) finish(ctx context.Context, job Job) {
+	ctx, span := w.otelTracer().Start(telemetry.Extract(ctx, job.TraceParent), "job.apply", trace.WithSpanKind(trace.SpanKindConsumer))
+	outcome := "error"
+	defer func() {
+		span.SetAttributes(
+			attribute.String("job.op", job.Op),
+			attribute.String("instance.name", job.Name),
+			attribute.String("job.outcome", outcome),
+		)
+		span.End()
+	}()
+
 	save, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 
@@ -99,12 +144,18 @@ func (w *Worker) finish(ctx context.Context, job Job) {
 	if err == nil {
 		if saveErr := w.queue.Succeed(save, job.ID, now); saveErr != nil {
 			slog.Error("succeed job", "job", job.ID, "err", saveErr)
+			span.RecordError(saveErr)
+			span.SetStatus(codes.Error, "succeed job")
 			return
 		}
+		outcome = "succeeded"
+		span.SetStatus(codes.Ok, "")
+		w.metrics.JobOutcome(outcome)
 		w.record(save, audit.ActionJobSucceeded, job, job.Name+" "+job.Op)
 		return
 	}
 	if errors.Is(err, ErrLocked) || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		outcome = "released"
 		if saveErr := w.queue.Release(save, job.ID, now, now.Add(w.cfg.Poll)); saveErr != nil {
 			slog.Error("release job", "job", job.ID, "err", saveErr)
 		}
@@ -112,12 +163,16 @@ func (w *Worker) finish(ctx context.Context, job Job) {
 	}
 
 	attempts := job.Attempts + 1
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
 	if attempts >= w.cfg.MaxAttempts {
 		slog.Error("job dead", "job", job.ID, "name", job.Name, "op", job.Op, "attempts", attempts, "err", err)
 		if saveErr := w.queue.Dead(save, job.ID, now, attempts, err.Error()); saveErr != nil {
 			slog.Error("mark job dead", "job", job.ID, "err", saveErr)
 			return
 		}
+		outcome = "dead"
+		w.metrics.JobOutcome(outcome)
 		w.record(save, audit.ActionJobDead, job, job.Name+" "+job.Op+": "+err.Error())
 		return
 	}
@@ -125,7 +180,9 @@ func (w *Worker) finish(ctx context.Context, job Job) {
 	slog.Info("job retry", "job", job.ID, "name", job.Name, "op", job.Op, "attempt", attempts, "backoff", delay.String(), "err", err)
 	if saveErr := w.queue.Retry(save, job.ID, now, now.Add(delay), attempts, err.Error()); saveErr != nil {
 		slog.Error("retry job", "job", job.ID, "err", saveErr)
+		return
 	}
+	outcome = "retry"
 }
 
 // applyProvider mutates the provider. Create and delete are idempotent:

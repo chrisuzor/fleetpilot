@@ -24,12 +24,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     run_after TIMESTAMPTZ NOT NULL,
     last_error TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
+    updated_at TIMESTAMPTZ NOT NULL,
+    trace_parent TEXT NOT NULL DEFAULT ''
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_per_instance
     ON jobs (instance_name)
     WHERE status IN ('pending', 'running');
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_parent TEXT NOT NULL DEFAULT '';
 
 -- Row lock taken for the duration of one provider call.
 CREATE TABLE IF NOT EXISTS instance_locks (

@@ -13,10 +13,17 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/chrisuzor/fleetpilot/internal/audit"
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
+	"github.com/chrisuzor/fleetpilot/internal/metrics"
 	"github.com/chrisuzor/fleetpilot/internal/reconcile"
 	"github.com/chrisuzor/fleetpilot/internal/rollout"
+	"github.com/chrisuzor/fleetpilot/internal/telemetry"
 	"github.com/chrisuzor/fleetpilot/internal/work"
 )
 
@@ -40,6 +47,8 @@ type Server struct {
 	reconciler *reconcile.Reconciler
 	worker     *work.Worker
 	roller     *rollout.Roller
+	metrics    *metrics.Metrics
+	tracer     trace.Tracer
 	poll       time.Duration
 }
 
@@ -49,21 +58,39 @@ func New(store fleet.Store, provider fleet.Provider, queue work.Queue, locker wo
 	if poll <= 0 {
 		poll = work.DefaultPoll
 	}
-	worker := work.NewWorker(queue, provider, locker, cfg)
+	traced := traceQueue{inner: queue}
+	worker := work.NewWorker(traced, provider, locker, cfg)
 	worker.SetAudit(events)
-	roller := rollout.New(store, provider, queue, checker)
+	m := metrics.New()
+	worker.SetMetrics(m)
+	roller := rollout.New(store, provider, traced, checker)
 	roller.SetAudit(events)
 	return &Server{
 		store:      store,
 		provider:   provider,
-		queue:      queue,
+		queue:      traced,
 		checker:    checker,
 		events:     events,
-		reconciler: reconcile.New(store, provider, queue),
+		reconciler: reconcile.New(store, provider, traced),
 		worker:     worker,
 		roller:     roller,
+		metrics:    m,
 		poll:       poll,
 	}
+}
+
+// SetTracer records the reconcile span and the worker span that applies its job.
+// Call it before RunWorker.
+func (s *Server) SetTracer(tr trace.Tracer) {
+	s.tracer = tr
+	s.worker.SetTracer(tr)
+}
+
+func (s *Server) otelTracer() trace.Tracer {
+	if s.tracer != nil {
+		return s.tracer
+	}
+	return otel.Tracer(telemetry.TracerName)
 }
 
 // RunWorker applies queued jobs until ctx is cancelled.
@@ -82,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 	write := requireRole(RoleOperator)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	mux.Handle("GET /metrics", s.metrics.Handler())
 	mux.HandleFunc("POST /v1/instances", write(s.create))
 	mux.HandleFunc("GET /v1/instances", read(s.list))
 	mux.HandleFunc("GET /v1/instances/{id}", read(s.get))
@@ -94,7 +122,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/rollouts", write(s.startRollout))
 	mux.HandleFunc("GET /v1/rollouts/{id}", write(s.getRollout))
 	mux.HandleFunc("GET /v1/audit", read(s.listAudit))
-	return logRequests(mux)
+	return s.logRequests(mux)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -231,13 +259,20 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
-	result, err := s.reconciler.Reconcile(r.Context())
+	ctx, span := s.otelTracer().Start(r.Context(), "reconcile", trace.WithSpanKind(trace.SpanKindServer))
+	defer span.End()
+	result, err := s.reconciler.Reconcile(ctx)
+	span.SetAttributes(attribute.Int("jobs.enqueued", len(result.Jobs)))
 	if err != nil {
+		s.metrics.ObserveReconcile("error")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "reconcile failed")
 		slog.Error("reconcile", "err", err, "enqueued", len(result.Jobs))
 		writeError(w, http.StatusInternalServerError, "reconcile failed")
 		return
 	}
-	s.record(r.Context(), audit.ActionReconcile, "reconcile", reconcileDetail(result.Jobs))
+	s.metrics.ObserveReconcile("ok")
+	s.record(ctx, audit.ActionReconcile, "reconcile", reconcileDetail(result.Jobs))
 	writeJSON(w, http.StatusOK, reconcileResponse{Jobs: toJobs(result.Jobs)})
 }
 
@@ -691,10 +726,15 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-func logRequests(next http.Handler) http.Handler {
+func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
 		next.ServeHTTP(sw, r)
+		pattern := r.Pattern
+		if pattern == "" {
+			pattern = "unmatched"
+		}
+		s.metrics.ObserveHTTP(r.Method, pattern, sw.code)
 		slog.Info("request", "method", r.Method, "path", r.URL.Path, "status", sw.code)
 	})
 }

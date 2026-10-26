@@ -35,17 +35,18 @@ var ErrNotFound = errors.New("not found")
 
 // Job is one provisioning operation for a single instance name.
 type Job struct {
-	ID         string
-	Name       string
-	Op         string
-	Spec       fleet.Spec
-	ProviderID string
-	Attempts   int
-	Status     string
-	RunAfter   time.Time
-	LastError  string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID          string
+	Name        string
+	Op          string
+	Spec        fleet.Spec
+	ProviderID  string
+	Attempts    int
+	Status      string
+	RunAfter    time.Time
+	LastError   string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	TraceParent string
 }
 
 // Queue stores provisioning jobs.

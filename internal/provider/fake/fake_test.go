@@ -66,3 +66,34 @@ func TestProvider_CreateUpdateDelete(t *testing.T) {
 		t.Fatalf("list after delete = %+v", list)
 	}
 }
+
+func TestProvider_FailNextDoesNotPersistAndUnhealthyCheck(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	p := fake.New()
+	spec := fleet.Spec{Image: "ubuntu-24.04", Size: "small", Region: "local"}
+	p.FailNext(1)
+	if _, err := p.Create(ctx, "web-1", spec); !errors.Is(err, fake.ErrInjected) {
+		t.Fatalf("create err = %v", err)
+	}
+	list, err := p.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("list after injected failure = %+v", list)
+	}
+	created, err := p.Create(ctx, "web-1", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check, err := p.Check(ctx, created.ID)
+	if err != nil || check.Status != fleet.HealthHealthy {
+		t.Fatalf("check = %+v err %v", check, err)
+	}
+	p.SetUnhealthy("web-1", "injected failure")
+	check, err = p.Check(ctx, created.ID)
+	if err != nil || check.Status != fleet.HealthUnhealthy || check.Detail != "injected failure" {
+		t.Fatalf("unhealthy check = %+v err %v", check, err)
+	}
+}

@@ -13,32 +13,48 @@ import (
 
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
 	"github.com/chrisuzor/fleetpilot/internal/reconcile"
+	"github.com/chrisuzor/fleetpilot/internal/rollout"
 	"github.com/chrisuzor/fleetpilot/internal/work"
 )
 
-// Server serves desired-state writes and reconcile runs.
+// Server serves desired-state writes, health checks, and rolling updates.
 type Server struct {
 	store      fleet.Store
 	provider   fleet.Provider
 	queue      work.Queue
+	checker    fleet.Checker
 	reconciler *reconcile.Reconciler
 	worker     *work.Worker
+	roller     *rollout.Roller
+	poll       time.Duration
 }
 
-// New wires the API to desired state, a provider, and the job worker.
-func New(store fleet.Store, provider fleet.Provider, queue work.Queue, locker work.Locker, cfg work.Config) *Server {
+// New wires the API to desired state, a provider, the job worker, and the roller.
+func New(store fleet.Store, provider fleet.Provider, queue work.Queue, locker work.Locker, checker fleet.Checker, cfg work.Config) *Server {
+	poll := cfg.Poll
+	if poll <= 0 {
+		poll = work.DefaultPoll
+	}
 	return &Server{
 		store:      store,
 		provider:   provider,
 		queue:      queue,
+		checker:    checker,
 		reconciler: reconcile.New(store, provider, queue),
 		worker:     work.NewWorker(queue, provider, locker, cfg),
+		roller:     rollout.New(store, provider, queue, checker),
+		poll:       poll,
 	}
 }
 
 // RunWorker applies queued jobs until ctx is cancelled.
 func (s *Server) RunWorker(ctx context.Context) {
 	s.worker.Run(ctx)
+}
+
+// RunRoller advances rolling updates until ctx is cancelled.
+func (s *Server) RunRoller(ctx context.Context) {
+	s.roller.Run(ctx, s.poll)
 }
 
 // Handler returns the HTTP routes.
@@ -50,8 +66,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/instances/{id}", s.get)
 	mux.HandleFunc("PATCH /v1/instances/{id}", s.patch)
 	mux.HandleFunc("DELETE /v1/instances/{id}", s.delete)
+	mux.HandleFunc("POST /v1/instances/{id}/health", s.checkHealth)
+	mux.HandleFunc("GET /v1/instances/{id}/health", s.getHealth)
 	mux.HandleFunc("POST /v1/reconcile", s.reconcile)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
+	mux.HandleFunc("POST /v1/rollouts", s.startRollout)
+	mux.HandleFunc("GET /v1/rollouts/{id}", s.getRollout)
 	return logRequests(mux)
 }
 
@@ -118,7 +138,13 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 		if inst, ok := actual[item.Name]; ok {
 			got = &inst
 		}
-		out = append(out, toInstance(item, got))
+		view, err := s.withHealth(r.Context(), item, toInstance(item, got))
+		if err != nil {
+			slog.Error("list health", "err", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		out = append(out, view)
 	}
 	writeJSON(w, http.StatusOK, listResponse{Instances: out})
 }
@@ -184,6 +210,83 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, reconcileResponse{Jobs: toJobs(result.Jobs)})
 }
 
+func (s *Server) checkHealth(w http.ResponseWriter, r *http.Request) {
+	item, err := s.store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, "get instance", err)
+		return
+	}
+	status, detail, err := s.probe(r.Context(), item.Name)
+	if err != nil {
+		slog.Error("health check", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	saved, err := s.store.RecordHealth(r.Context(), item.ID, status, detail, time.Now().UTC())
+	if err != nil {
+		slog.Error("record health", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, toHealth(saved))
+}
+
+func (s *Server) getHealth(w http.ResponseWriter, r *http.Request) {
+	item, err := s.store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, "get instance", err)
+		return
+	}
+	check, err := s.store.LatestHealth(r.Context(), item.ID)
+	if err != nil {
+		if errors.Is(err, fleet.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		slog.Error("get health", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, toHealth(check))
+}
+
+func (s *Server) startRollout(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Image  string `json:"image"`
+		Size   string `json:"size"`
+		Region string `json:"region"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	spec := fleet.Spec{Image: req.Image, Size: req.Size, Region: req.Region}
+	if err := spec.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	roll, err := s.roller.Start(r.Context(), spec)
+	if err != nil {
+		if errors.Is(err, fleet.ErrConflict) {
+			writeError(w, http.StatusConflict, "a rollout is already running")
+			return
+		}
+		slog.Error("start rollout", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	w.Header().Set("Location", "/v1/rollouts/"+roll.ID)
+	writeJSON(w, http.StatusCreated, toRollout(roll))
+}
+
+func (s *Server) getRollout(w http.ResponseWriter, r *http.Request) {
+	roll, err := s.store.GetRollout(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, "get rollout", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toRollout(roll))
+}
+
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	job, err := s.queue.GetJob(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -207,7 +310,38 @@ func (s *Server) view(ctx context.Context, item fleet.Desired) (instanceResponse
 	if inst, ok := actual[item.Name]; ok {
 		got = &inst
 	}
-	return toInstance(item, got), nil
+	return s.withHealth(ctx, item, toInstance(item, got))
+}
+
+func (s *Server) probe(ctx context.Context, name string) (string, string, error) {
+	actual, err := s.actualByName(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	inst, ok := actual[name]
+	if !ok {
+		return fleet.HealthUnhealthy, "not running", nil
+	}
+	result, err := s.checker.Check(ctx, inst.ID)
+	if errors.Is(err, fleet.ErrNotFound) {
+		return fleet.HealthUnhealthy, "not running", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return result.Status, result.Detail, nil
+}
+
+func (s *Server) withHealth(ctx context.Context, item fleet.Desired, resp instanceResponse) (instanceResponse, error) {
+	check, err := s.store.LatestHealth(ctx, item.ID)
+	if errors.Is(err, fleet.ErrNotFound) {
+		return resp, nil
+	}
+	if err != nil {
+		return instanceResponse{}, err
+	}
+	resp.Health = toHealth(check)
+	return resp, nil
 }
 
 func (s *Server) actualByName(ctx context.Context) (map[string]fleet.Actual, error) {
@@ -232,8 +366,29 @@ type instanceResponse struct {
 	Desired   specResponse    `json:"desired"`
 	Actual    *actualResponse `json:"actual"`
 	InSync    bool            `json:"in_sync"`
+	Health    *healthResponse `json:"health"`
 	CreatedAt time.Time       `json:"created_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
+}
+
+type healthResponse struct {
+	ID        string    `json:"id"`
+	Status    string    `json:"status"`
+	Detail    string    `json:"detail"`
+	CheckedAt time.Time `json:"checked_at"`
+}
+
+type rolloutResponse struct {
+	ID          string                    `json:"id"`
+	Status      string                    `json:"status"`
+	PauseReason string                    `json:"pause_reason"`
+	Spec        specResponse              `json:"spec"`
+	Instances   []rolloutInstanceResponse `json:"instances"`
+}
+
+type rolloutInstanceResponse struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
 }
 
 type specResponse struct {
@@ -295,6 +450,46 @@ func toJobs(jobs []work.Job) []jobResponse {
 		out = append(out, toJob(job))
 	}
 	return out
+}
+
+func toHealth(check fleet.HealthCheck) *healthResponse {
+	return &healthResponse{
+		ID:        check.ID,
+		Status:    check.Status,
+		Detail:    check.Detail,
+		CheckedAt: check.CheckedAt,
+	}
+}
+
+func toRollout(roll fleet.Rollout) rolloutResponse {
+	instances := make([]rolloutInstanceResponse, 0, len(roll.Names))
+	for i, name := range roll.Names {
+		instances = append(instances, rolloutInstanceResponse{Name: name, State: rolloutState(roll, i)})
+	}
+	return rolloutResponse{
+		ID:          roll.ID,
+		Status:      roll.Status,
+		PauseReason: roll.PauseReason,
+		Spec: specResponse{
+			Image:  roll.Spec.Image,
+			Size:   roll.Spec.Size,
+			Region: roll.Spec.Region,
+		},
+		Instances: instances,
+	}
+}
+
+func rolloutState(roll fleet.Rollout, index int) string {
+	switch {
+	case index < roll.Next:
+		return "updated"
+	case roll.Status == fleet.RolloutPaused && index == roll.Next:
+		return "failed"
+	case roll.Status == fleet.RolloutRunning && index == roll.Next && roll.Phase != fleet.PhaseIdle:
+		return "updating"
+	default:
+		return "pending"
+	}
 }
 
 func toJob(job work.Job) jobResponse {

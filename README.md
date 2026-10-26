@@ -4,25 +4,27 @@
 
 FleetPilot is a small control plane for a simulated fleet of virtual machines. It stores the fleet you want in PostgreSQL and drives a provider until the fleet you have matches.
 
-The provider is an in-process fake. That is the point: the control loop is real, and it does not need a cloud account, credentials, or money. Reconcile enqueues a job. A worker applies that job to the fake provider.
+The provider is an in-process fake. That is the point: the control loop is real, and it does not need a cloud account, credentials, or money. Reconcile enqueues a job. A worker applies that job to the fake provider. A rolling update changes one instance at a time and pauses when a health check fails.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   client[Client] --> api[Go API]
-  api --> db[(PostgreSQL desired state and jobs)]
+  api --> db[(PostgreSQL)]
   api --> rec[Reconciler]
   rec --> db
   rec --> provider[Provider list]
   worker[Worker] --> db
   worker --> lock[Instance row lock]
   lock --> provider
+  roller[Roller] --> db
+  roller --> provider
   provider --> fake[Fake provider actual state]
   api --> provider
 ```
 
-PostgreSQL stores desired instances: name, image, size, and region. It also stores provisioning jobs and one lock row per instance name. The provider stores actual instances. Fetching an instance reads actual state from the provider at that moment. The live spec is not copied back into PostgreSQL.
+PostgreSQL stores desired instances: name, image, size, and region. It also stores provisioning jobs, health checks, rollouts, and one lock row per instance name. The provider stores actual instances. Fetching an instance reads actual state from the provider at that moment. The live spec is not copied back into PostgreSQL. The latest health check is.
 
 Reconcile lists both sides and matches them by name. It does not call `Create`, `Update`, or `Delete`. It enqueues one job per difference:
 
@@ -68,6 +70,25 @@ Before the provider call, the worker opens a transaction, inserts the instance n
 
 If another transaction already holds the row, `SKIP LOCKED` returns no row. The worker does not call the provider. Two API processes cannot apply the same instance at once. Different names are different rows, so they run together, up to the in-flight limit.
 
+### Health checks
+
+`POST /v1/instances/{id}/health` asks the provider and stores the result. `GET /v1/instances/{id}/health` returns the newest stored check. Instance responses include that check, or `null` when none has been stored.
+
+A running fake instance is `healthy`. An instance that is not in the provider yet is `unhealthy` with detail `not running`.
+
+### Rolling update
+
+`POST /v1/rollouts` snapshots the desired names in name order and stores the new spec. The roller then handles one name at a time:
+
+1. Write the new spec onto that desired instance and enqueue one update job.
+2. Wait until that job succeeds.
+3. Store a health check.
+4. A `healthy` check moves to the next name. An `unhealthy` check sets the rollout to `paused` with `pause_reason` `health check failed`.
+
+The pause leaves every later instance on its old spec. Instances already updated stay on the new spec, including the one whose check failed. Another step does not continue the rollout. One running rollout is allowed at a time.
+
+A job that reaches `dead` also pauses the rollout, with `pause_reason` `job dead`, and does not change the next instance. Provider errors still use the retry backoff above. The fifth failure is what marks the job dead.
+
 ## Run
 
 Docker Compose starts the API and PostgreSQL:
@@ -101,6 +122,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/instances \
   "desired": {"image": "ubuntu-24.04", "size": "small", "region": "local"},
   "actual": null,
   "in_sync": false,
+  "health": null,
   "created_at": "2026-10-26T18:00:00Z",
   "updated_at": "2026-10-26T18:00:00Z"
 }
@@ -158,7 +180,8 @@ curl -sS http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef
     "region": "local",
     "status": "running"
   },
-  "in_sync": true
+  "in_sync": true,
+  "health": null
 }
 ```
 
@@ -191,19 +214,58 @@ curl -sS -X DELETE http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef
 curl -sS -X POST http://127.0.0.1:8080/v1/reconcile
 ```
 
-`GET /v1/instances` lists desired instances with the actual state joined in.
+`GET /v1/instances` lists desired instances with the actual state and the latest health check joined in.
+
+Check an instance after the worker has created it:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef/health
+```
+
+```json
+{
+  "id": "chk_0123456789abcdef",
+  "status": "healthy",
+  "detail": "running",
+  "checked_at": "2026-10-26T18:00:00Z"
+}
+```
+
+Roll `web-1`, `web-2`, and `web-3` to `medium` one at a time. With `web-2` unhealthy, the rollout pauses after `web-2` and leaves `web-3` on the old spec:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/rollouts \
+  -H 'content-type: application/json' \
+  -d '{"image":"ubuntu-24.04","size":"medium","region":"local"}'
+```
+
+```json
+{
+  "id": "roll_0123456789abcdef",
+  "status": "paused",
+  "pause_reason": "health check failed",
+  "spec": {"image": "ubuntu-24.04", "size": "medium", "region": "local"},
+  "instances": [
+    {"name": "web-1", "state": "updated"},
+    {"name": "web-2", "state": "failed"},
+    {"name": "web-3", "state": "pending"}
+  ]
+}
+```
+
+`GET /v1/rollouts/roll_0123456789abcdef` returns the same shape. The response above is the paused rollout. The create response is `running` until the roller finishes the checks.
 
 ## Trade-off
 
 The fake provider is the point. FleetPilot's job is to remember desired state and converge actual state. An in-memory provider proves that loop — enqueue, apply, retry, and a second reconcile that enqueues nothing — without Docker in the unit tests and without cloud credentials.
 
-The cost is that this does not provision real infrastructure. Quotas, cloud error shapes, and instance boot time are not exercised. Actual instances live only in the API process. Restarting the API clears them. Desired rows and job history remain in PostgreSQL, and the next reconcile enqueues creates for anything missing. A later provider implements the same `Provider` interface. The reconciler still only enqueues, and the worker still applies.
+The cost is that this does not provision real infrastructure. Quotas, cloud error shapes, and instance boot time are not exercised. Actual instances live only in the API process. Restarting the API clears them, including which names fail a health check. Desired rows, job history, health checks, and rollouts remain in PostgreSQL. The next reconcile enqueues creates for anything missing, and a new rollout reads health from the provider again. A later provider implements the same `Provider` interface. The reconciler still only enqueues, and the worker still applies.
 
 The API does not authenticate callers. Keep it on localhost.
 
 ## Tests
 
-Unit tests use an in-memory queue, an in-memory lock, and the fake provider. They do not start PostgreSQL, Docker, or a cloud client. The module requires Go 1.25.
+Unit tests use an in-memory queue, an in-memory lock, and the fake provider. They do not start PostgreSQL, Docker, or a cloud client. Failure-injection tests make the fake provider return an error. The job retries with the backoff above, then succeeds, or becomes `dead` on the fifth failure. A failed health check stops a rolling update. The module requires Go 1.25.
 
 ```bash
 go test -race ./...
@@ -215,14 +277,14 @@ GitHub Actions runs that command on every push. The job does not start PostgreSQ
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | yes | | PostgreSQL URL for desired state and jobs |
+| `DATABASE_URL` | yes | | PostgreSQL URL for desired state, jobs, health checks, and rollouts |
 | `PORT` | no | `8080` | API port |
 
 Compose sets both. There is no provider switch. The process always uses the fake provider. The worker runs with four in-flight jobs, five attempts, a 100ms base delay, a 5s cap, and a 50ms poll.
 
 ## Not in this slice
 
-Kubernetes, Terraform, OpenTelemetry, Prometheus, and authentication are intentionally absent.
+Kubernetes, Terraform, OpenTelemetry, Prometheus, audit logs, and authentication are intentionally absent.
 
 ## License
 

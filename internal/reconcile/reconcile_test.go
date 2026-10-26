@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
 	"github.com/chrisuzor/fleetpilot/internal/provider/fake"
@@ -347,6 +348,24 @@ func (s listStore) UpdateSpec(context.Context, string, fleet.Spec) (fleet.Desire
 }
 func (s listStore) Delete(context.Context, string) error { return errors.New("unexpected delete") }
 func (s listStore) Ping(context.Context) error           { return nil }
+func (s listStore) RecordHealth(context.Context, string, string, string, time.Time) (fleet.HealthCheck, error) {
+	return fleet.HealthCheck{}, errors.New("unexpected health")
+}
+func (s listStore) LatestHealth(context.Context, string) (fleet.HealthCheck, error) {
+	return fleet.HealthCheck{}, errors.New("unexpected health")
+}
+func (s listStore) CreateRollout(context.Context, fleet.Spec, []string, time.Time) (fleet.Rollout, error) {
+	return fleet.Rollout{}, errors.New("unexpected rollout")
+}
+func (s listStore) GetRollout(context.Context, string) (fleet.Rollout, error) {
+	return fleet.Rollout{}, errors.New("unexpected rollout")
+}
+func (s listStore) SaveRollout(context.Context, fleet.Rollout) error {
+	return errors.New("unexpected rollout")
+}
+func (s listStore) ListRunningRollouts(context.Context) ([]fleet.Rollout, error) {
+	return nil, errors.New("unexpected rollout")
+}
 
 type listProvider struct {
 	items []fleet.Actual

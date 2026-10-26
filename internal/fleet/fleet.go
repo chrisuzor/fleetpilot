@@ -17,6 +17,22 @@ const (
 	OpCreate = "create"
 	OpUpdate = "update"
 	OpDelete = "delete"
+
+	HealthHealthy   = "healthy"
+	HealthUnhealthy = "unhealthy"
+
+	RolloutRunning   = "running"
+	RolloutPaused    = "paused"
+	RolloutSucceeded = "succeeded"
+
+	PhaseIdle     = "idle"
+	PhaseApplying = "applying"
+	PhaseChecking = "checking"
+
+	// PauseHealthFailed means the rollout applied one instance, stored an
+	// unhealthy check, and did not change any later instance.
+	PauseHealthFailed = "health check failed"
+	PauseJobDead      = "job dead"
 )
 
 var (
@@ -84,6 +100,41 @@ type Actual struct {
 	Status string
 }
 
+// HealthCheck is one stored result for a desired instance.
+type HealthCheck struct {
+	ID         string
+	InstanceID string
+	Status     string
+	Detail     string
+	CheckedAt  time.Time
+}
+
+// Check is the provider's answer for one actual instance.
+type Check struct {
+	Status string
+	Detail string
+}
+
+// Checker reads health from actual state. The result is stored separately.
+type Checker interface {
+	Check(ctx context.Context, id string) (Check, error)
+}
+
+// Rollout changes instance specs one name at a time.
+// Names are the desired names captured when the rollout started, in name order.
+type Rollout struct {
+	ID          string
+	Spec        Spec
+	Status      string
+	PauseReason string
+	Names       []string
+	Next        int
+	Phase       string
+	JobID       string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
 // Store is the desired-state database.
 // Reconcile only lists it. Creates, updates, and deletes of desired state
 // happen through the API.
@@ -94,6 +145,14 @@ type Store interface {
 	UpdateSpec(ctx context.Context, id string, spec Spec) (Desired, error)
 	Delete(ctx context.Context, id string) error
 	Ping(ctx context.Context) error
+
+	RecordHealth(ctx context.Context, instanceID, status, detail string, at time.Time) (HealthCheck, error)
+	LatestHealth(ctx context.Context, instanceID string) (HealthCheck, error)
+
+	CreateRollout(ctx context.Context, spec Spec, names []string, at time.Time) (Rollout, error)
+	GetRollout(ctx context.Context, id string) (Rollout, error)
+	SaveRollout(ctx context.Context, rollout Rollout) error
+	ListRunningRollouts(ctx context.Context) ([]Rollout, error)
 }
 
 // Provider is the actual-state source for VM instances.

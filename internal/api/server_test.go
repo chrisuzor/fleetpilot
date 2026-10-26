@@ -186,19 +186,26 @@ func TestAPI_DuplicateNameAndMissingInstance(t *testing.T) {
 
 func testServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	ts, _ := testServerWithProvider(t)
+	return ts
+}
+
+func testServerWithProvider(t *testing.T) (*httptest.Server, *fake.Provider) {
+	t.Helper()
 	queue := work.NewQueue()
 	provider := fake.New()
 	cfg := work.DefaultConfig()
 	cfg.Poll = time.Millisecond
 	cfg.BaseDelay = time.Millisecond
 	cfg.MaxDelay = 5 * time.Millisecond
-	server := api.New(memory.New(), provider, queue, work.NewLock(), cfg)
+	server := api.New(memory.New(), provider, queue, work.NewLock(), provider, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	go server.RunWorker(ctx)
+	go server.RunRoller(ctx)
 	ts := httptest.NewServer(server.Handler())
 	t.Cleanup(ts.Close)
 	t.Cleanup(cancel)
-	return ts
+	return ts, provider
 }
 
 func createAndSync(t *testing.T, ts *httptest.Server) string {
@@ -282,6 +289,11 @@ type instancePayload struct {
 		Status string `json:"status"`
 	} `json:"actual"`
 	InSync bool `json:"in_sync"`
+	Health *struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+		Detail string `json:"detail"`
+	} `json:"health"`
 }
 
 type reconcilePayload struct {
@@ -313,6 +325,169 @@ func decodeReconcile(t *testing.T, raw []byte) reconcilePayload {
 func decodeJob(t *testing.T, raw []byte) jobPayload {
 	t.Helper()
 	var payload jobPayload
+	decode(t, raw, &payload)
+	return payload
+}
+
+func TestAPI_HealthCheckIsStored(t *testing.T) {
+	t.Parallel()
+	ts := testServer(t)
+	code, raw := do(t, ts, http.MethodPost, "/v1/instances", `{"name":"web-1","image":"ubuntu-24.04","size":"small","region":"local"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create status %d body %s", code, raw)
+	}
+	created := decodeInstance(t, raw)
+	if created.Health != nil {
+		t.Fatalf("health before a check = %+v", created.Health)
+	}
+	code, raw = do(t, ts, http.MethodGet, "/v1/instances/"+created.ID+"/health", "")
+	if code != http.StatusNotFound {
+		t.Fatalf("health before check status %d body %s", code, raw)
+	}
+
+	code, raw = do(t, ts, http.MethodPost, "/v1/instances/"+created.ID+"/health", "")
+	if code != http.StatusOK {
+		t.Fatalf("check status %d body %s", code, raw)
+	}
+	var checked healthPayload
+	decode(t, raw, &checked)
+	if checked.Status != "unhealthy" || checked.Detail != "not running" || !strings.HasPrefix(checked.ID, "chk_") {
+		t.Fatalf("check = %+v", checked)
+	}
+
+	code, raw = do(t, ts, http.MethodGet, "/v1/instances/"+created.ID, "")
+	got := decodeInstance(t, raw)
+	if code != http.StatusOK || got.Health == nil || got.Health.Status != "unhealthy" || got.Health.ID != checked.ID {
+		t.Fatalf("instance health status %d %+v", code, got.Health)
+	}
+
+	code, raw = do(t, ts, http.MethodPost, "/v1/reconcile", "")
+	if code != http.StatusOK {
+		t.Fatalf("reconcile status %d body %s", code, raw)
+	}
+	if waitJob(t, ts, decodeReconcile(t, raw).Jobs[0].ID).Status != "succeeded" {
+		t.Fatal("create job did not succeed")
+	}
+	code, raw = do(t, ts, http.MethodPost, "/v1/instances/"+created.ID+"/health", "")
+	if code != http.StatusOK {
+		t.Fatalf("second check status %d body %s", code, raw)
+	}
+	decode(t, raw, &checked)
+	if checked.Status != "healthy" || checked.Detail != "running" {
+		t.Fatalf("running check = %+v", checked)
+	}
+	code, raw = do(t, ts, http.MethodGet, "/v1/instances/"+created.ID+"/health", "")
+	var latest healthPayload
+	decode(t, raw, &latest)
+	if code != http.StatusOK || latest.ID != checked.ID || latest.Status != "healthy" {
+		t.Fatalf("latest status %d %+v", code, latest)
+	}
+}
+
+func TestAPI_RollingUpdateStopsOnFailedHealthCheck(t *testing.T) {
+	t.Parallel()
+	ts, provider := testServerWithProvider(t)
+	for _, name := range []string{"web-1", "web-2", "web-3"} {
+		body := `{"name":"` + name + `","image":"ubuntu-24.04","size":"small","region":"local"}`
+		code, raw := do(t, ts, http.MethodPost, "/v1/instances", body)
+		if code != http.StatusCreated {
+			t.Fatalf("create %s status %d body %s", name, code, raw)
+		}
+	}
+	code, raw := do(t, ts, http.MethodPost, "/v1/reconcile", "")
+	if code != http.StatusOK {
+		t.Fatalf("reconcile status %d body %s", code, raw)
+	}
+	for _, job := range decodeReconcile(t, raw).Jobs {
+		if waitJob(t, ts, job.ID).Status != "succeeded" {
+			t.Fatalf("job %+v did not succeed", job)
+		}
+	}
+	provider.SetUnhealthy("web-2", "injected failure")
+
+	code, raw = do(t, ts, http.MethodPost, "/v1/rollouts", `{"image":"ubuntu-24.04","size":"medium","region":"local"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("rollout status %d body %s", code, raw)
+	}
+	started := decodeRollout(t, raw)
+	if started.Status != "running" || len(started.Instances) != 3 || !strings.HasPrefix(started.ID, "roll_") {
+		t.Fatalf("started = %+v", started)
+	}
+	roll := waitRollout(t, ts, started.ID)
+	if roll.Status != "paused" || roll.PauseReason != "health check failed" {
+		t.Fatalf("rollout = %+v", roll)
+	}
+	if roll.Instances[0].Name != "web-1" || roll.Instances[0].State != "updated" ||
+		roll.Instances[1].Name != "web-2" || roll.Instances[1].State != "failed" ||
+		roll.Instances[2].Name != "web-3" || roll.Instances[2].State != "pending" {
+		t.Fatalf("instances = %+v", roll.Instances)
+	}
+
+	byName := map[string]instancePayload{}
+	code, raw = do(t, ts, http.MethodGet, "/v1/instances", "")
+	if code != http.StatusOK {
+		t.Fatalf("list status %d body %s", code, raw)
+	}
+	var listed struct {
+		Instances []instancePayload `json:"instances"`
+	}
+	decode(t, raw, &listed)
+	for _, item := range listed.Instances {
+		byName[item.Name] = item
+	}
+	if byName["web-1"].Desired.Size != "medium" || byName["web-1"].Actual == nil || byName["web-1"].Actual.Size != "medium" || byName["web-1"].Health == nil || byName["web-1"].Health.Status != "healthy" {
+		t.Fatalf("web-1 = %+v health %+v", byName["web-1"], byName["web-1"].Health)
+	}
+	if byName["web-2"].Desired.Size != "medium" || byName["web-2"].Actual == nil || byName["web-2"].Actual.Size != "medium" || byName["web-2"].Health == nil || byName["web-2"].Health.Status != "unhealthy" || byName["web-2"].Health.Detail != "injected failure" {
+		t.Fatalf("web-2 = %+v health %+v", byName["web-2"], byName["web-2"].Health)
+	}
+	if byName["web-3"].Desired.Size != "small" || byName["web-3"].Actual == nil || byName["web-3"].Actual.Size != "small" || byName["web-3"].Health != nil {
+		t.Fatalf("web-3 = %+v health %+v", byName["web-3"], byName["web-3"].Health)
+	}
+	code, raw = do(t, ts, http.MethodPost, "/v1/reconcile", "")
+	if code != http.StatusOK || strings.TrimSpace(string(raw)) != `{"jobs":[]}` {
+		t.Fatalf("reconcile after pause status %d body %s", code, raw)
+	}
+}
+
+func waitRollout(t *testing.T, ts *httptest.Server, id string) rolloutPayload {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last rolloutPayload
+	for time.Now().Before(deadline) {
+		code, raw := do(t, ts, http.MethodGet, "/v1/rollouts/"+id, "")
+		if code != http.StatusOK {
+			t.Fatalf("rollout status %d body %s", code, raw)
+		}
+		last = decodeRollout(t, raw)
+		if last.Status == "paused" || last.Status == "succeeded" {
+			return last
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("rollout %s did not finish: %+v", id, last)
+	return last
+}
+
+type healthPayload struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+type rolloutPayload struct {
+	ID          string `json:"id"`
+	Status      string `json:"status"`
+	PauseReason string `json:"pause_reason"`
+	Instances   []struct {
+		Name  string `json:"name"`
+		State string `json:"state"`
+	} `json:"instances"`
+}
+
+func decodeRollout(t *testing.T, raw []byte) rolloutPayload {
+	t.Helper()
+	var payload rolloutPayload
 	decode(t, raw, &payload)
 	return payload
 }

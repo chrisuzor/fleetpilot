@@ -49,14 +49,19 @@ func run() error {
 	}
 
 	// The fake provider is the only provider. It keeps actual state in this
-	// process. Desired state and jobs stay in PostgreSQL.
+	// process. Desired state, jobs, health checks, and rollouts stay in PostgreSQL.
 	provider := fake.New()
 	cfg := work.DefaultConfig()
-	server := api.New(store, provider, store, store, cfg)
+	server := api.New(store, provider, store, store, provider, cfg)
 	workerDone := make(chan struct{})
+	rollerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
 		server.RunWorker(ctx)
+	}()
+	go func() {
+		defer close(rollerDone)
+		server.RunRoller(ctx)
 	}()
 	httpServer := &http.Server{
 		Addr:              ":" + port,
@@ -77,6 +82,7 @@ func run() error {
 	case err := <-errCh:
 		stop()
 		<-workerDone
+		<-rollerDone
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -86,6 +92,7 @@ func run() error {
 		defer cancel()
 		err := httpServer.Shutdown(shutdownCtx)
 		<-workerDone
+		<-rollerDone
 		if err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}

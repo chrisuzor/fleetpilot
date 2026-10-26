@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chrisuzor/fleetpilot/internal/audit"
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
 )
 
@@ -17,6 +18,7 @@ type Worker struct {
 	provider fleet.Provider
 	locker   Locker
 	cfg      Config
+	audit    audit.Log
 }
 
 // NewWorker returns a worker. Zero config fields use the defaults.
@@ -27,6 +29,11 @@ func NewWorker(queue Queue, provider fleet.Provider, locker Locker, cfg Config) 
 		locker:   locker,
 		cfg:      cfg.normalize(),
 	}
+}
+
+// SetAudit records job outcomes. A nil log leaves outcomes unrecorded.
+func (w *Worker) SetAudit(log audit.Log) {
+	w.audit = log
 }
 
 // Run claims jobs until ctx is cancelled.
@@ -92,7 +99,9 @@ func (w *Worker) finish(ctx context.Context, job Job) {
 	if err == nil {
 		if saveErr := w.queue.Succeed(save, job.ID, now); saveErr != nil {
 			slog.Error("succeed job", "job", job.ID, "err", saveErr)
+			return
 		}
+		w.record(save, audit.ActionJobSucceeded, job, job.Name+" "+job.Op)
 		return
 	}
 	if errors.Is(err, ErrLocked) || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -107,7 +116,9 @@ func (w *Worker) finish(ctx context.Context, job Job) {
 		slog.Error("job dead", "job", job.ID, "name", job.Name, "op", job.Op, "attempts", attempts, "err", err)
 		if saveErr := w.queue.Dead(save, job.ID, now, attempts, err.Error()); saveErr != nil {
 			slog.Error("mark job dead", "job", job.ID, "err", saveErr)
+			return
 		}
+		w.record(save, audit.ActionJobDead, job, job.Name+" "+job.Op+": "+err.Error())
 		return
 	}
 	delay := Backoff(attempts, w.cfg.BaseDelay, w.cfg.MaxDelay)
@@ -160,6 +171,20 @@ func (w *Worker) applyProvider(ctx context.Context, job Job) error {
 		return err
 	default:
 		return fmt.Errorf("unknown op %q", job.Op)
+	}
+}
+
+func (w *Worker) record(ctx context.Context, action string, job Job, detail string) {
+	if w.audit == nil {
+		return
+	}
+	if _, err := w.audit.AppendAudit(ctx, audit.Event{
+		Actor:    audit.ActorWorker,
+		Action:   action,
+		Resource: job.ID,
+		Detail:   detail,
+	}); err != nil {
+		slog.Error("audit", "action", action, "job", job.ID, "err", err)
 	}
 }
 

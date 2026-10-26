@@ -49,10 +49,11 @@ func run() error {
 	}
 
 	// The fake provider is the only provider. It keeps actual state in this
-	// process. Desired state, jobs, health checks, and rollouts stay in PostgreSQL.
+	// process. Desired state, jobs, health checks, rollouts, and the audit log
+	// stay in PostgreSQL.
 	provider := fake.New()
 	cfg := work.DefaultConfig()
-	server := api.New(store, provider, store, store, provider, cfg)
+	server := api.New(store, provider, store, store, provider, store, cfg)
 	workerDone := make(chan struct{})
 	rollerDone := make(chan struct{})
 	go func() {

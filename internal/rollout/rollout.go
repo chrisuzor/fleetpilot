@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chrisuzor/fleetpilot/internal/audit"
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
 	"github.com/chrisuzor/fleetpilot/internal/work"
 )
@@ -21,12 +22,18 @@ type Roller struct {
 	provider fleet.Provider
 	queue    work.Queue
 	checker  fleet.Checker
+	audit    audit.Log
 	mu       sync.Mutex
 }
 
 // New returns a roller. store holds desired state, health checks, and rollouts.
 func New(store fleet.Store, provider fleet.Provider, queue work.Queue, checker fleet.Checker) *Roller {
 	return &Roller{store: store, provider: provider, queue: queue, checker: checker}
+}
+
+// SetAudit records rollout pauses. A nil log leaves pauses unrecorded.
+func (r *Roller) SetAudit(log audit.Log) {
+	r.audit = log
 }
 
 // Start snapshots desired names in name order and stores a running rollout.
@@ -234,7 +241,32 @@ func (r *Roller) finish(ctx context.Context, roll fleet.Rollout, status, reason 
 	if err := r.store.SaveRollout(ctx, roll); err != nil {
 		return fleet.Rollout{}, err
 	}
-	return r.store.GetRollout(ctx, roll.ID)
+	saved, err := r.store.GetRollout(ctx, roll.ID)
+	if err != nil {
+		return fleet.Rollout{}, err
+	}
+	if saved.Status == fleet.RolloutPaused {
+		r.recordPause(ctx, saved)
+	}
+	return saved, nil
+}
+
+func (r *Roller) recordPause(ctx context.Context, roll fleet.Rollout) {
+	if r.audit == nil {
+		return
+	}
+	detail := roll.PauseReason
+	if roll.Next >= 0 && roll.Next < len(roll.Names) {
+		detail = roll.Names[roll.Next] + ": " + roll.PauseReason
+	}
+	if _, err := r.audit.AppendAudit(ctx, audit.Event{
+		Actor:    audit.ActorRoller,
+		Action:   audit.ActionRolloutPause,
+		Resource: roll.ID,
+		Detail:   detail,
+	}); err != nil {
+		slog.Error("audit", "action", audit.ActionRolloutPause, "rollout", roll.ID, "err", err)
+	}
 }
 
 func (r *Roller) actual(ctx context.Context, name string) (fleet.Actual, bool, error) {

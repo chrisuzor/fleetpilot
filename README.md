@@ -24,7 +24,7 @@ flowchart LR
   api --> provider
 ```
 
-PostgreSQL stores desired instances: name, image, size, and region. It also stores provisioning jobs, health checks, rollouts, and one lock row per instance name. The provider stores actual instances. Fetching an instance reads actual state from the provider at that moment. The live spec is not copied back into PostgreSQL. The latest health check is.
+PostgreSQL stores desired instances: name, image, size, and region. It also stores provisioning jobs, health checks, rollouts, an audit log, and one lock row per instance name. The provider stores actual instances. Fetching an instance reads actual state from the provider at that moment. The live spec is not copied back into PostgreSQL. The latest health check is.
 
 Reconcile lists both sides and matches them by name. It does not call `Create`, `Update`, or `Delete`. It enqueues one job per difference:
 
@@ -103,7 +103,28 @@ The Compose database user and password are both `fleetpilot`. That is a local de
 
 Stop it with `docker compose down`. Add `-v` to drop the database volume.
 
-`GET /healthz` returns `{"status":"ok"}` when the API can reach PostgreSQL.
+`GET /healthz` returns `{"status":"ok"}` when the API can reach PostgreSQL. That probe does not take a role. It only says the process can reach the database.
+
+## Roles
+
+Every `/v1` request sends a role header. There is no token and no shared secret. The process trusts the header because this slice has no identity provider. Keep the API on localhost.
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/instances \
+  -H 'X-FleetPilot-Role: reader'
+```
+
+| Header | Value |
+| --- | --- |
+| `X-FleetPilot-Role` | `reader` or `operator` |
+
+A missing or unknown value is `401`. A reader calling an operator route is `403`.
+
+A reader can list and get instances, get a stored health check, and read the audit log.
+
+An operator can do that, and can also create, update, and delete instances, run a health check, reconcile, read a job, and start or read a rollout.
+
+`GET /v1/audit` returns the newest rows. Instance creates, updates, and deletes are stored with the caller role. Reconciles are too. The worker stores `job.succeeded` and `job.dead`. The roller stores `rollout.pause`.
 
 ## Example requests
 
@@ -111,6 +132,7 @@ Create stores desired state only. `actual` is null until the worker finishes the
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/instances \
+  -H 'X-FleetPilot-Role: operator' \
   -H 'content-type: application/json' \
   -d '{"name":"web-1","image":"ubuntu-24.04","size":"small","region":"local"}'
 ```
@@ -131,13 +153,15 @@ curl -sS -X POST http://127.0.0.1:8080/v1/instances \
 Get the same instance. Use the `id` from the create response.
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef
+curl -sS http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef \
+  -H 'X-FleetPilot-Role: reader'
 ```
 
 Reconcile enqueues a create job. The worker applies it.
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/reconcile
+curl -sS -X POST http://127.0.0.1:8080/v1/reconcile \
+  -H 'X-FleetPilot-Role: operator'
 ```
 
 ```json
@@ -159,13 +183,15 @@ curl -sS -X POST http://127.0.0.1:8080/v1/reconcile
 Read the job. `status` becomes `succeeded` when the provider call finishes.
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/jobs/job_0123456789abcdef
+curl -sS http://127.0.0.1:8080/v1/jobs/job_0123456789abcdef \
+  -H 'X-FleetPilot-Role: operator'
 ```
 
 Get the instance again. `in_sync` is true when the provider spec matches the desired spec.
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef
+curl -sS http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef \
+  -H 'X-FleetPilot-Role: reader'
 ```
 
 ```json
@@ -188,7 +214,8 @@ curl -sS http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef
 Reconcile again. Nothing changed, so no job is enqueued:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/reconcile
+curl -sS -X POST http://127.0.0.1:8080/v1/reconcile \
+  -H 'X-FleetPilot-Role: operator'
 ```
 
 ```json
@@ -201,17 +228,21 @@ To change a spec, patch the desired row and reconcile. The response is an `updat
 
 ```bash
 curl -sS -X PATCH http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef \
+  -H 'X-FleetPilot-Role: operator' \
   -H 'content-type: application/json' \
   -d '{"image":"ubuntu-24.04","size":"medium","region":"local"}'
 
-curl -sS -X POST http://127.0.0.1:8080/v1/reconcile
+curl -sS -X POST http://127.0.0.1:8080/v1/reconcile \
+  -H 'X-FleetPilot-Role: operator'
 ```
 
 To remove an instance, delete the desired row, then reconcile. The response is a `delete` job. The reconcile after the worker finishes is empty.
 
 ```bash
-curl -sS -X DELETE http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef
-curl -sS -X POST http://127.0.0.1:8080/v1/reconcile
+curl -sS -X DELETE http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef \
+  -H 'X-FleetPilot-Role: operator'
+curl -sS -X POST http://127.0.0.1:8080/v1/reconcile \
+  -H 'X-FleetPilot-Role: operator'
 ```
 
 `GET /v1/instances` lists desired instances with the actual state and the latest health check joined in.
@@ -219,7 +250,8 @@ curl -sS -X POST http://127.0.0.1:8080/v1/reconcile
 Check an instance after the worker has created it:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef/health
+curl -sS -X POST http://127.0.0.1:8080/v1/instances/inst_0123456789abcdef/health \
+  -H 'X-FleetPilot-Role: operator'
 ```
 
 ```json
@@ -235,6 +267,7 @@ Roll `web-1`, `web-2`, and `web-3` to `medium` one at a time. With `web-2` unhea
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/v1/rollouts \
+  -H 'X-FleetPilot-Role: operator' \
   -H 'content-type: application/json' \
   -d '{"image":"ubuntu-24.04","size":"medium","region":"local"}'
 ```
@@ -253,7 +286,29 @@ curl -sS -X POST http://127.0.0.1:8080/v1/rollouts \
 }
 ```
 
-`GET /v1/rollouts/roll_0123456789abcdef` returns the same shape. The response above is the paused rollout. The create response is `running` until the roller finishes the checks.
+`GET /v1/rollouts/roll_0123456789abcdef` with `X-FleetPilot-Role: operator` returns the same shape. The response above is the paused rollout. The create response is `running` until the roller finishes the checks.
+
+Read the audit log. A reader can do this. The newest row is first.
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/audit \
+  -H 'X-FleetPilot-Role: reader'
+```
+
+```json
+{
+  "events": [
+    {
+      "id": "aud_0123456789abcdef",
+      "at": "2026-10-26T18:00:00Z",
+      "actor": "operator",
+      "action": "instance.create",
+      "resource": "inst_0123456789abcdef",
+      "detail": "web-1"
+    }
+  ]
+}
+```
 
 ## Trade-off
 
@@ -261,11 +316,11 @@ The fake provider is the point. FleetPilot's job is to remember desired state an
 
 The cost is that this does not provision real infrastructure. Quotas, cloud error shapes, and instance boot time are not exercised. Actual instances live only in the API process. Restarting the API clears them, including which names fail a health check. Desired rows, job history, health checks, and rollouts remain in PostgreSQL. The next reconcile enqueues creates for anything missing, and a new rollout reads health from the provider again. A later provider implements the same `Provider` interface. The reconciler still only enqueues, and the worker still applies.
 
-The API does not authenticate callers. Keep it on localhost.
+The role header is not authentication against an identity provider. Anyone who can reach the port can claim `operator`. That is acceptable here because the API stays on localhost and the header is a label, not a credential.
 
 ## Tests
 
-Unit tests use an in-memory queue, an in-memory lock, and the fake provider. They do not start PostgreSQL, Docker, or a cloud client. Failure-injection tests make the fake provider return an error. The job retries with the backoff above, then succeeds, or becomes `dead` on the fifth failure. A failed health check stops a rolling update. The module requires Go 1.25.
+Unit tests use an in-memory queue, an in-memory lock, an in-memory audit log, and the fake provider. They do not start PostgreSQL, Docker, or a cloud client. Requests in those tests send `X-FleetPilot-Role`. Failure-injection tests make the fake provider return an error. The job retries with the backoff above, then succeeds, or becomes `dead` on the fifth failure. A failed health check stops a rolling update. The module requires Go 1.25.
 
 ```bash
 go test -race ./...
@@ -284,7 +339,7 @@ Compose sets both. There is no provider switch. The process always uses the fake
 
 ## Not in this slice
 
-Kubernetes, Terraform, OpenTelemetry, Prometheus, audit logs, and authentication are intentionally absent.
+Kubernetes, Terraform, OpenTelemetry, and Prometheus are intentionally absent. The role header is not an identity provider.
 
 ## License
 

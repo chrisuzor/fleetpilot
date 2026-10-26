@@ -67,3 +67,16 @@ CREATE TABLE IF NOT EXISTS rollouts (
 CREATE UNIQUE INDEX IF NOT EXISTS rollouts_one_running
     ON rollouts (status)
     WHERE status = 'running';
+
+-- Append-only record of instance changes, reconciles, job outcomes, and rollout pauses.
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    at TIMESTAMPTZ NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS audit_logs_at
+    ON audit_logs (at DESC, id DESC);

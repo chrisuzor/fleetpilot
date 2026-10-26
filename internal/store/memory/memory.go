@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chrisuzor/fleetpilot/internal/audit"
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
 )
 
@@ -18,6 +19,7 @@ type Store struct {
 	byName   map[string]string
 	health   []fleet.HealthCheck
 	rollouts map[string]fleet.Rollout
+	events   []audit.Event
 }
 
 var _ fleet.Store = (*Store)(nil)

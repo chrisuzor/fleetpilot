@@ -5,17 +5,30 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/chrisuzor/fleetpilot/internal/audit"
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
 	"github.com/chrisuzor/fleetpilot/internal/reconcile"
 	"github.com/chrisuzor/fleetpilot/internal/rollout"
 	"github.com/chrisuzor/fleetpilot/internal/work"
 )
+
+const (
+	// RoleHeader is how local development chooses a role.
+	// The value is reader or operator. It is not a secret.
+	RoleHeader   = "X-FleetPilot-Role"
+	RoleReader   = "reader"
+	RoleOperator = "operator"
+)
+
+type roleContextKey struct{}
 
 // Server serves desired-state writes, health checks, and rolling updates.
 type Server struct {
@@ -23,6 +36,7 @@ type Server struct {
 	provider   fleet.Provider
 	queue      work.Queue
 	checker    fleet.Checker
+	events     audit.Log
 	reconciler *reconcile.Reconciler
 	worker     *work.Worker
 	roller     *rollout.Roller
@@ -30,19 +44,24 @@ type Server struct {
 }
 
 // New wires the API to desired state, a provider, the job worker, and the roller.
-func New(store fleet.Store, provider fleet.Provider, queue work.Queue, locker work.Locker, checker fleet.Checker, cfg work.Config) *Server {
+func New(store fleet.Store, provider fleet.Provider, queue work.Queue, locker work.Locker, checker fleet.Checker, events audit.Log, cfg work.Config) *Server {
 	poll := cfg.Poll
 	if poll <= 0 {
 		poll = work.DefaultPoll
 	}
+	worker := work.NewWorker(queue, provider, locker, cfg)
+	worker.SetAudit(events)
+	roller := rollout.New(store, provider, queue, checker)
+	roller.SetAudit(events)
 	return &Server{
 		store:      store,
 		provider:   provider,
 		queue:      queue,
 		checker:    checker,
+		events:     events,
 		reconciler: reconcile.New(store, provider, queue),
-		worker:     work.NewWorker(queue, provider, locker, cfg),
-		roller:     rollout.New(store, provider, queue, checker),
+		worker:     worker,
+		roller:     roller,
 		poll:       poll,
 	}
 }
@@ -59,19 +78,22 @@ func (s *Server) RunRoller(ctx context.Context) {
 
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
+	read := requireRole(RoleReader, RoleOperator)
+	write := requireRole(RoleOperator)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
-	mux.HandleFunc("POST /v1/instances", s.create)
-	mux.HandleFunc("GET /v1/instances", s.list)
-	mux.HandleFunc("GET /v1/instances/{id}", s.get)
-	mux.HandleFunc("PATCH /v1/instances/{id}", s.patch)
-	mux.HandleFunc("DELETE /v1/instances/{id}", s.delete)
-	mux.HandleFunc("POST /v1/instances/{id}/health", s.checkHealth)
-	mux.HandleFunc("GET /v1/instances/{id}/health", s.getHealth)
-	mux.HandleFunc("POST /v1/reconcile", s.reconcile)
-	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
-	mux.HandleFunc("POST /v1/rollouts", s.startRollout)
-	mux.HandleFunc("GET /v1/rollouts/{id}", s.getRollout)
+	mux.HandleFunc("POST /v1/instances", write(s.create))
+	mux.HandleFunc("GET /v1/instances", read(s.list))
+	mux.HandleFunc("GET /v1/instances/{id}", read(s.get))
+	mux.HandleFunc("PATCH /v1/instances/{id}", write(s.patch))
+	mux.HandleFunc("DELETE /v1/instances/{id}", write(s.delete))
+	mux.HandleFunc("POST /v1/instances/{id}/health", write(s.checkHealth))
+	mux.HandleFunc("GET /v1/instances/{id}/health", read(s.getHealth))
+	mux.HandleFunc("POST /v1/reconcile", write(s.reconcile))
+	mux.HandleFunc("GET /v1/jobs/{id}", write(s.getJob))
+	mux.HandleFunc("POST /v1/rollouts", write(s.startRollout))
+	mux.HandleFunc("GET /v1/rollouts/{id}", write(s.getRollout))
+	mux.HandleFunc("GET /v1/audit", read(s.listAudit))
 	return logRequests(mux)
 }
 
@@ -110,6 +132,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, "create instance", err)
 		return
 	}
+	s.record(r.Context(), audit.ActionInstanceCreate, created.ID, created.Name)
 	view, err := s.view(r.Context(), created)
 	if err != nil {
 		slog.Error("read actual", "err", err)
@@ -183,6 +206,7 @@ func (s *Server) patch(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, "update instance", err)
 		return
 	}
+	s.record(r.Context(), audit.ActionInstanceUpdate, updated.ID, spec.Image+" "+spec.Size+" "+spec.Region)
 	view, err := s.view(r.Context(), updated)
 	if err != nil {
 		slog.Error("read actual", "err", err)
@@ -193,10 +217,16 @@ func (s *Server) patch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Delete(r.Context(), r.PathValue("id")); err != nil {
+	item, err := s.store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
 		writeStoreError(w, "delete instance", err)
 		return
 	}
+	if err := s.store.Delete(r.Context(), item.ID); err != nil {
+		writeStoreError(w, "delete instance", err)
+		return
+	}
+	s.record(r.Context(), audit.ActionInstanceDelete, item.ID, item.Name)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -207,7 +237,31 @@ func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "reconcile failed")
 		return
 	}
+	s.record(r.Context(), audit.ActionReconcile, "reconcile", reconcileDetail(result.Jobs))
 	writeJSON(w, http.StatusOK, reconcileResponse{Jobs: toJobs(result.Jobs)})
+}
+
+func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 100 {
+			writeError(w, http.StatusBadRequest, "limit must be from 1 to 100")
+			return
+		}
+		limit = n
+	}
+	if s.events == nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	events, err := s.events.ListAudit(r.Context(), limit)
+	if err != nil {
+		slog.Error("list audit", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, auditListResponse{Events: toAudit(events)})
 }
 
 func (s *Server) checkHealth(w http.ResponseWriter, r *http.Request) {
@@ -409,6 +463,19 @@ type reconcileResponse struct {
 	Jobs []jobResponse `json:"jobs"`
 }
 
+type auditListResponse struct {
+	Events []auditResponse `json:"events"`
+}
+
+type auditResponse struct {
+	ID       string    `json:"id"`
+	At       time.Time `json:"at"`
+	Actor    string    `json:"actor"`
+	Action   string    `json:"action"`
+	Resource string    `json:"resource"`
+	Detail   string    `json:"detail"`
+}
+
 type jobResponse struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -442,6 +509,21 @@ func toInstance(item fleet.Desired, actual *fleet.Actual) instanceResponse {
 		resp.InSync = actual.Spec.Equal(item.Spec)
 	}
 	return resp
+}
+
+func toAudit(events []audit.Event) []auditResponse {
+	out := make([]auditResponse, 0, len(events))
+	for _, event := range events {
+		out = append(out, auditResponse{
+			ID:       event.ID,
+			At:       event.At,
+			Actor:    event.Actor,
+			Action:   event.Action,
+			Resource: event.Resource,
+			Detail:   event.Detail,
+		})
+	}
+	return out
 }
 
 func toJobs(jobs []work.Job) []jobResponse {
@@ -522,6 +604,57 @@ func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+func (s *Server) record(ctx context.Context, action, resource, detail string) {
+	if s.events == nil {
+		return
+	}
+	if _, err := s.events.AppendAudit(ctx, audit.Event{
+		Actor:    roleFrom(ctx),
+		Action:   action,
+		Resource: resource,
+		Detail:   detail,
+	}); err != nil {
+		slog.Error("audit", "action", action, "resource", resource, "err", err)
+	}
+}
+
+func reconcileDetail(jobs []work.Job) string {
+	if len(jobs) == 0 {
+		return "enqueued=0"
+	}
+	parts := make([]string, len(jobs))
+	for i, job := range jobs {
+		parts[i] = job.Name + ":" + job.Op
+	}
+	return fmt.Sprintf("enqueued=%d %s", len(jobs), strings.Join(parts, " "))
+}
+
+func requireRole(roles ...string) func(http.HandlerFunc) http.HandlerFunc {
+	allowed := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		allowed[role] = struct{}{}
+	}
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			role := strings.TrimSpace(r.Header.Get(RoleHeader))
+			if role != RoleReader && role != RoleOperator {
+				writeError(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+			if _, ok := allowed[role]; !ok {
+				writeError(w, http.StatusForbidden, "forbidden")
+				return
+			}
+			next(w, r.WithContext(context.WithValue(r.Context(), roleContextKey{}, role)))
+		}
+	}
+}
+
+func roleFrom(ctx context.Context) string {
+	role, _ := ctx.Value(roleContextKey{}).(string)
+	return role
 }
 
 func writeStoreError(w http.ResponseWriter, op string, err error) {

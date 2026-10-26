@@ -194,11 +194,12 @@ func testServerWithProvider(t *testing.T) (*httptest.Server, *fake.Provider) {
 	t.Helper()
 	queue := work.NewQueue()
 	provider := fake.New()
+	store := memory.New()
 	cfg := work.DefaultConfig()
 	cfg.Poll = time.Millisecond
 	cfg.BaseDelay = time.Millisecond
 	cfg.MaxDelay = 5 * time.Millisecond
-	server := api.New(memory.New(), provider, queue, work.NewLock(), provider, cfg)
+	server := api.New(store, provider, queue, work.NewLock(), provider, store, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	go server.RunWorker(ctx)
 	go server.RunRoller(ctx)
@@ -250,6 +251,11 @@ func waitJob(t *testing.T, ts *httptest.Server, id string) jobPayload {
 
 func do(t *testing.T, ts *httptest.Server, method, path, body string) (int, []byte) {
 	t.Helper()
+	return doAs(t, ts, "operator", method, path, body)
+}
+
+func doAs(t *testing.T, ts *httptest.Server, role, method, path, body string) (int, []byte) {
+	t.Helper()
 	var reader io.Reader
 	if body != "" {
 		reader = strings.NewReader(body)
@@ -257,6 +263,9 @@ func do(t *testing.T, ts *httptest.Server, method, path, body string) (int, []by
 	req, err := http.NewRequest(method, ts.URL+path, reader)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if role != "" {
+		req.Header.Set("X-FleetPilot-Role", role)
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
@@ -448,6 +457,49 @@ func TestAPI_RollingUpdateStopsOnFailedHealthCheck(t *testing.T) {
 	if code != http.StatusOK || strings.TrimSpace(string(raw)) != `{"jobs":[]}` {
 		t.Fatalf("reconcile after pause status %d body %s", code, raw)
 	}
+	events := listAudit(t, ts, "reader")
+	if !hasAudit(events, "rollout.pause", started.ID, "roller") {
+		t.Fatalf("audit = %+v", events)
+	}
+}
+
+func TestAPI_OperatorCreateReaderForbiddenAndAudited(t *testing.T) {
+	t.Parallel()
+	ts := testServer(t)
+	body := `{"name":"web-1","image":"ubuntu-24.04","size":"small","region":"local"}`
+
+	code, raw := doAs(t, ts, "", http.MethodPost, "/v1/instances", body)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("missing role status %d body %s", code, raw)
+	}
+	code, raw = doAs(t, ts, "reader", http.MethodPost, "/v1/instances", body)
+	if code != http.StatusForbidden {
+		t.Fatalf("reader create status %d body %s", code, raw)
+	}
+	code, raw = doAs(t, ts, "reader", http.MethodGet, "/v1/instances", "")
+	if code != http.StatusOK {
+		t.Fatalf("reader list status %d body %s", code, raw)
+	}
+	code, raw = doAs(t, ts, "reader", http.MethodGet, "/v1/audit", "")
+	if code != http.StatusOK || strings.TrimSpace(string(raw)) != `{"events":[]}` {
+		t.Fatalf("empty audit status %d body %s", code, raw)
+	}
+
+	code, raw = do(t, ts, http.MethodPost, "/v1/instances", body)
+	if code != http.StatusCreated {
+		t.Fatalf("operator create status %d body %s", code, raw)
+	}
+	created := decodeInstance(t, raw)
+	events := listAudit(t, ts, "reader")
+	var found bool
+	for _, event := range events {
+		if event.Action == "instance.create" && event.Resource == created.ID && event.Actor == "operator" && event.Detail == "web-1" && strings.HasPrefix(event.ID, "aud_") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("audit = %+v", events)
+	}
 }
 
 func waitRollout(t *testing.T, ts *httptest.Server, id string) rolloutPayload {
@@ -483,6 +535,36 @@ type rolloutPayload struct {
 		Name  string `json:"name"`
 		State string `json:"state"`
 	} `json:"instances"`
+}
+
+type auditPayload struct {
+	ID       string `json:"id"`
+	Actor    string `json:"actor"`
+	Action   string `json:"action"`
+	Resource string `json:"resource"`
+	Detail   string `json:"detail"`
+}
+
+func listAudit(t *testing.T, ts *httptest.Server, role string) []auditPayload {
+	t.Helper()
+	code, raw := doAs(t, ts, role, http.MethodGet, "/v1/audit", "")
+	if code != http.StatusOK {
+		t.Fatalf("audit status %d body %s", code, raw)
+	}
+	var payload struct {
+		Events []auditPayload `json:"events"`
+	}
+	decode(t, raw, &payload)
+	return payload.Events
+}
+
+func hasAudit(events []auditPayload, action, resource, actor string) bool {
+	for _, event := range events {
+		if event.Action == action && event.Resource == resource && event.Actor == actor {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeRollout(t *testing.T, raw []byte) rolloutPayload {

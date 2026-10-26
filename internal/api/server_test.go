@@ -1,16 +1,19 @@
 package api_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chrisuzor/fleetpilot/internal/api"
 	"github.com/chrisuzor/fleetpilot/internal/provider/fake"
 	"github.com/chrisuzor/fleetpilot/internal/store/memory"
+	"github.com/chrisuzor/fleetpilot/internal/work"
 )
 
 func TestAPI_CreateGetReconcileNoop(t *testing.T) {
@@ -43,8 +46,11 @@ func TestAPI_CreateGetReconcileNoop(t *testing.T) {
 		t.Fatalf("reconcile status %d body %s", code, raw)
 	}
 	first := decodeReconcile(t, raw)
-	if len(first.Actions) != 1 || first.Actions[0].Op != "create" || first.Actions[0].Name != "web-1" || !strings.HasPrefix(first.Actions[0].ProviderID, "vm_") {
+	if len(first.Jobs) != 1 || first.Jobs[0].Op != "create" || first.Jobs[0].Name != "web-1" || first.Jobs[0].Status != "pending" || !strings.HasPrefix(first.Jobs[0].ID, "job_") {
 		t.Fatalf("reconcile = %+v", first)
+	}
+	if waitJob(t, ts, first.Jobs[0].ID).Status != "succeeded" {
+		t.Fatal("create job did not succeed")
 	}
 
 	code, raw = do(t, ts, http.MethodGet, "/v1/instances/"+created.ID, "")
@@ -52,11 +58,8 @@ func TestAPI_CreateGetReconcileNoop(t *testing.T) {
 		t.Fatalf("get after reconcile status %d body %s", code, raw)
 	}
 	synced := decodeInstance(t, raw)
-	if !synced.InSync || synced.Actual == nil || synced.Actual.Status != "running" || synced.Actual.Size != "small" {
+	if !synced.InSync || synced.Actual == nil || synced.Actual.Status != "running" || synced.Actual.Size != "small" || !strings.HasPrefix(synced.Actual.ID, "vm_") {
 		t.Fatalf("synced = %+v", synced)
-	}
-	if synced.Actual.ID != first.Actions[0].ProviderID {
-		t.Fatalf("actual id = %s, want %s", synced.Actual.ID, first.Actions[0].ProviderID)
 	}
 
 	code, raw = do(t, ts, http.MethodGet, "/v1/instances", "")
@@ -75,7 +78,7 @@ func TestAPI_CreateGetReconcileNoop(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("second reconcile status %d body %s", code, raw)
 	}
-	if strings.TrimSpace(string(raw)) != `{"actions":[]}` {
+	if strings.TrimSpace(string(raw)) != `{"jobs":[]}` {
 		t.Fatalf("second reconcile body = %s", raw)
 	}
 }
@@ -99,8 +102,11 @@ func TestAPI_UpdateAndDelete(t *testing.T) {
 		t.Fatalf("update reconcile status %d body %s", code, raw)
 	}
 	updated := decodeReconcile(t, raw)
-	if len(updated.Actions) != 1 || updated.Actions[0].Op != "update" || updated.Actions[0].Name != "web-1" {
+	if len(updated.Jobs) != 1 || updated.Jobs[0].Op != "update" || updated.Jobs[0].Name != "web-1" {
 		t.Fatalf("update reconcile = %+v", updated)
+	}
+	if waitJob(t, ts, updated.Jobs[0].ID).Status != "succeeded" {
+		t.Fatal("update job did not succeed")
 	}
 
 	code, raw = do(t, ts, http.MethodGet, "/v1/instances/"+id, "")
@@ -109,7 +115,7 @@ func TestAPI_UpdateAndDelete(t *testing.T) {
 		t.Fatalf("after update status %d instance %+v", code, got)
 	}
 	code, raw = do(t, ts, http.MethodPost, "/v1/reconcile", "")
-	if code != http.StatusOK || strings.TrimSpace(string(raw)) != `{"actions":[]}` {
+	if code != http.StatusOK || strings.TrimSpace(string(raw)) != `{"jobs":[]}` {
 		t.Fatalf("noop after update status %d body %s", code, raw)
 	}
 
@@ -126,11 +132,14 @@ func TestAPI_UpdateAndDelete(t *testing.T) {
 		t.Fatalf("delete reconcile status %d body %s", code, raw)
 	}
 	deleted := decodeReconcile(t, raw)
-	if len(deleted.Actions) != 1 || deleted.Actions[0].Op != "delete" || deleted.Actions[0].Name != "web-1" {
+	if len(deleted.Jobs) != 1 || deleted.Jobs[0].Op != "delete" || deleted.Jobs[0].Name != "web-1" {
 		t.Fatalf("delete reconcile = %+v", deleted)
 	}
+	if waitJob(t, ts, deleted.Jobs[0].ID).Status != "succeeded" {
+		t.Fatal("delete job did not succeed")
+	}
 	code, raw = do(t, ts, http.MethodPost, "/v1/reconcile", "")
-	if code != http.StatusOK || strings.TrimSpace(string(raw)) != `{"actions":[]}` {
+	if code != http.StatusOK || strings.TrimSpace(string(raw)) != `{"jobs":[]}` {
 		t.Fatalf("noop after delete status %d body %s", code, raw)
 	}
 }
@@ -177,8 +186,18 @@ func TestAPI_DuplicateNameAndMissingInstance(t *testing.T) {
 
 func testServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(api.New(memory.New(), fake.New()).Handler())
+	queue := work.NewQueue()
+	provider := fake.New()
+	cfg := work.DefaultConfig()
+	cfg.Poll = time.Millisecond
+	cfg.BaseDelay = time.Millisecond
+	cfg.MaxDelay = 5 * time.Millisecond
+	server := api.New(memory.New(), provider, queue, work.NewLock(), cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	go server.RunWorker(ctx)
+	ts := httptest.NewServer(server.Handler())
 	t.Cleanup(ts.Close)
+	t.Cleanup(cancel)
 	return ts
 }
 
@@ -193,10 +212,33 @@ func createAndSync(t *testing.T, ts *httptest.Server) string {
 	if code != http.StatusOK {
 		t.Fatalf("reconcile status %d body %s", code, raw)
 	}
-	if actions := decodeReconcile(t, raw).Actions; len(actions) != 1 || actions[0].Op != "create" {
-		t.Fatalf("setup reconcile = %+v", actions)
+	jobs := decodeReconcile(t, raw).Jobs
+	if len(jobs) != 1 || jobs[0].Op != "create" {
+		t.Fatalf("setup reconcile = %+v", jobs)
+	}
+	if waitJob(t, ts, jobs[0].ID).Status != "succeeded" {
+		t.Fatal("setup job did not succeed")
 	}
 	return created.ID
+}
+
+func waitJob(t *testing.T, ts *httptest.Server, id string) jobPayload {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last jobPayload
+	for time.Now().Before(deadline) {
+		code, raw := do(t, ts, http.MethodGet, "/v1/jobs/"+id, "")
+		if code != http.StatusOK {
+			t.Fatalf("job status %d body %s", code, raw)
+		}
+		last = decodeJob(t, raw)
+		if last.Status == "succeeded" || last.Status == "dead" {
+			return last
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("job %s did not finish: %+v", id, last)
+	return last
 }
 
 func do(t *testing.T, ts *httptest.Server, method, path, body string) (int, []byte) {
@@ -243,11 +285,15 @@ type instancePayload struct {
 }
 
 type reconcilePayload struct {
-	Actions []struct {
-		Op         string `json:"op"`
-		Name       string `json:"name"`
-		ProviderID string `json:"provider_id"`
-	} `json:"actions"`
+	Jobs []jobPayload `json:"jobs"`
+}
+
+type jobPayload struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Op       string `json:"op"`
+	Status   string `json:"status"`
+	Attempts int    `json:"attempts"`
 }
 
 func decodeInstance(t *testing.T, raw []byte) instancePayload {
@@ -260,6 +306,13 @@ func decodeInstance(t *testing.T, raw []byte) instancePayload {
 func decodeReconcile(t *testing.T, raw []byte) reconcilePayload {
 	t.Helper()
 	var payload reconcilePayload
+	decode(t, raw, &payload)
+	return payload
+}
+
+func decodeJob(t *testing.T, raw []byte) jobPayload {
+	t.Helper()
+	var payload jobPayload
 	decode(t, raw, &payload)
 	return payload
 }

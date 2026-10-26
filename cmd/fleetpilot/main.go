@@ -15,6 +15,7 @@ import (
 	"github.com/chrisuzor/fleetpilot/internal/api"
 	"github.com/chrisuzor/fleetpilot/internal/provider/fake"
 	"github.com/chrisuzor/fleetpilot/internal/store/postgres"
+	"github.com/chrisuzor/fleetpilot/internal/work"
 )
 
 func main() {
@@ -47,10 +48,16 @@ func run() error {
 		return err
 	}
 
-	// The fake provider is the only provider in this slice. It keeps actual
-	// state in this process. Desired state stays in PostgreSQL.
+	// The fake provider is the only provider. It keeps actual state in this
+	// process. Desired state and jobs stay in PostgreSQL.
 	provider := fake.New()
-	server := api.New(store, provider)
+	cfg := work.DefaultConfig()
+	server := api.New(store, provider, store, store, cfg)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		server.RunWorker(ctx)
+	}()
 	httpServer := &http.Server{
 		Addr:              ":" + port,
 		Handler:           server.Handler(),
@@ -62,12 +69,14 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("listening", "port", port, "provider", "fake")
+		slog.Info("listening", "port", port, "provider", "fake", "max_in_flight", cfg.MaxInFlight)
 		errCh <- httpServer.ListenAndServe()
 	}()
 
 	select {
 	case err := <-errCh:
+		stop()
+		<-workerDone
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -75,7 +84,9 @@ func run() error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		err := httpServer.Shutdown(shutdownCtx)
+		<-workerDone
+		if err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}
 		return nil

@@ -39,6 +39,10 @@ func Connect(ctx context.Context, databaseURL string) (*Store, error) {
 			_, err := conn.Exec(ctx, "SET TIME ZONE 'UTC'")
 			return err
 		}
+		// Each in-flight job holds one pool connection for its instance lock.
+		if cfg.MaxConns < 16 {
+			cfg.MaxConns = 16
+		}
 		pool, err := pgxpool.NewWithConfig(ctx, cfg)
 		if err == nil {
 			pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)

@@ -84,19 +84,6 @@ type Actual struct {
 	Status string
 }
 
-// Action is one mutation a reconcile run applied to the provider.
-type Action struct {
-	Op         string
-	Name       string
-	ProviderID string
-}
-
-// Result is a finished reconcile run.
-// Actions is empty when actual state already matched desired state.
-type Result struct {
-	Actions []Action
-}
-
 // Store is the desired-state database.
 // Reconcile only lists it. Creates, updates, and deletes of desired state
 // happen through the API.

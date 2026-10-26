@@ -1,4 +1,5 @@
-// Package reconcile converges provider instances to desired state.
+// Package reconcile compares desired state with the provider and enqueues
+// provisioning jobs. It does not call the provider's mutating methods.
 package reconcile
 
 import (
@@ -8,48 +9,54 @@ import (
 	"sync"
 
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
+	"github.com/chrisuzor/fleetpilot/internal/work"
 )
 
-// Reconciler reads desired state from the store and actual state from the
-// provider. It does not write the store.
+// Reconciler reads desired state and actual state, then enqueues the
+// difference. A worker applies the jobs.
 type Reconciler struct {
 	store    fleet.Store
 	provider fleet.Provider
+	queue    work.Queue
 	mu       sync.Mutex
 }
 
-// New returns a reconciler. Runs are serialized in this process.
-func New(store fleet.Store, provider fleet.Provider) *Reconciler {
-	return &Reconciler{store: store, provider: provider}
+// Result is the jobs a reconcile run newly queued or refreshed.
+// Jobs is empty when nothing changed, including a second run with the same spec.
+type Result struct {
+	Jobs []work.Job
 }
 
-// Reconcile creates, updates, and deletes provider instances until actual
-// state matches desired state. Instances are matched by name.
+// New returns a reconciler. Runs are serialized in this process.
+func New(store fleet.Store, provider fleet.Provider, queue work.Queue) *Reconciler {
+	return &Reconciler{store: store, provider: provider, queue: queue}
+}
+
+// Reconcile enqueues create, update, and delete jobs until the queue
+// describes the difference between desired and actual state.
+// Instances are matched by name.
 //
-// A run that finds no difference returns no actions and does not call
-// Create, Update, or Delete. It still lists both sides.
-//
-// On a provider error, actions already applied are returned with the error.
-// A later run continues from the provider's current state.
-func (r *Reconciler) Reconcile(ctx context.Context) (fleet.Result, error) {
+// A run that finds no difference, or whose jobs are already queued, returns
+// no jobs and does not call Create, Update, or Delete.
+func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	desired, err := r.store.List(ctx)
 	if err != nil {
-		return fleet.Result{}, fmt.Errorf("list desired: %w", err)
+		return Result{}, fmt.Errorf("list desired: %w", err)
 	}
 	actual, err := r.provider.List(ctx)
 	if err != nil {
-		return fleet.Result{}, fmt.Errorf("list actual: %w", err)
+		return Result{}, fmt.Errorf("list actual: %w", err)
 	}
 	desiredByName, err := fleet.DesiredByName(desired)
 	if err != nil {
-		return fleet.Result{}, err
+		return Result{}, err
 	}
 	actualByName, err := fleet.ActualByName(actual)
 	if err != nil {
-		return fleet.Result{}, err
+		return Result{}, err
 	}
 
 	names := make([]string, 0, len(desiredByName))
@@ -58,37 +65,38 @@ func (r *Reconciler) Reconcile(ctx context.Context) (fleet.Result, error) {
 	}
 	sort.Strings(names)
 
-	actions := make([]fleet.Action, 0)
+	jobs := make([]work.Job, 0)
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
-			return fleet.Result{Actions: actions}, err
+			return Result{Jobs: jobs}, err
 		}
 		want := desiredByName[name]
 		have, ok := actualByName[name]
-		if !ok {
-			created, err := r.provider.Create(ctx, want.Name, want.Spec)
-			if err != nil {
-				return fleet.Result{Actions: actions}, fmt.Errorf("create %s: %w", name, err)
-			}
-			actions = append(actions, fleet.Action{
-				Op:         fleet.OpCreate,
-				Name:       name,
-				ProviderID: created.ID,
-			})
+		var (
+			op         string
+			providerID string
+		)
+		switch {
+		case !ok:
+			op = fleet.OpCreate
+		case want.Spec.Equal(have.Spec):
 			continue
+		default:
+			op = fleet.OpUpdate
+			providerID = have.ID
 		}
-		if want.Spec.Equal(have.Spec) {
-			continue
-		}
-		updated, err := r.provider.Update(ctx, have.ID, want.Spec)
-		if err != nil {
-			return fleet.Result{Actions: actions}, fmt.Errorf("update %s: %w", name, err)
-		}
-		actions = append(actions, fleet.Action{
-			Op:         fleet.OpUpdate,
+		job, fresh, err := r.queue.Enqueue(ctx, work.Job{
 			Name:       name,
-			ProviderID: updated.ID,
+			Op:         op,
+			Spec:       want.Spec,
+			ProviderID: providerID,
 		})
+		if err != nil {
+			return Result{Jobs: jobs}, fmt.Errorf("enqueue %s: %w", name, err)
+		}
+		if fresh {
+			jobs = append(jobs, job)
+		}
 	}
 
 	orphans := make([]string, 0)
@@ -100,17 +108,20 @@ func (r *Reconciler) Reconcile(ctx context.Context) (fleet.Result, error) {
 	sort.Strings(orphans)
 	for _, name := range orphans {
 		if err := ctx.Err(); err != nil {
-			return fleet.Result{Actions: actions}, err
+			return Result{Jobs: jobs}, err
 		}
 		have := actualByName[name]
-		if err := r.provider.Delete(ctx, have.ID); err != nil {
-			return fleet.Result{Actions: actions}, fmt.Errorf("delete %s: %w", name, err)
-		}
-		actions = append(actions, fleet.Action{
-			Op:         fleet.OpDelete,
+		job, fresh, err := r.queue.Enqueue(ctx, work.Job{
 			Name:       name,
+			Op:         fleet.OpDelete,
 			ProviderID: have.ID,
 		})
+		if err != nil {
+			return Result{Jobs: jobs}, fmt.Errorf("enqueue %s: %w", name, err)
+		}
+		if fresh {
+			jobs = append(jobs, job)
+		}
 	}
-	return fleet.Result{Actions: actions}, nil
+	return Result{Jobs: jobs}, nil
 }

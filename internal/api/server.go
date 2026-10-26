@@ -13,22 +13,32 @@ import (
 
 	"github.com/chrisuzor/fleetpilot/internal/fleet"
 	"github.com/chrisuzor/fleetpilot/internal/reconcile"
+	"github.com/chrisuzor/fleetpilot/internal/work"
 )
 
 // Server serves desired-state writes and reconcile runs.
 type Server struct {
 	store      fleet.Store
 	provider   fleet.Provider
+	queue      work.Queue
 	reconciler *reconcile.Reconciler
+	worker     *work.Worker
 }
 
-// New wires the API to a desired-state store and a provider.
-func New(store fleet.Store, provider fleet.Provider) *Server {
+// New wires the API to desired state, a provider, and the job worker.
+func New(store fleet.Store, provider fleet.Provider, queue work.Queue, locker work.Locker, cfg work.Config) *Server {
 	return &Server{
 		store:      store,
 		provider:   provider,
-		reconciler: reconcile.New(store, provider),
+		queue:      queue,
+		reconciler: reconcile.New(store, provider, queue),
+		worker:     work.NewWorker(queue, provider, locker, cfg),
 	}
+}
+
+// RunWorker applies queued jobs until ctx is cancelled.
+func (s *Server) RunWorker(ctx context.Context) {
+	s.worker.Run(ctx)
 }
 
 // Handler returns the HTTP routes.
@@ -41,6 +51,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /v1/instances/{id}", s.patch)
 	mux.HandleFunc("DELETE /v1/instances/{id}", s.delete)
 	mux.HandleFunc("POST /v1/reconcile", s.reconcile)
+	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
 	return logRequests(mux)
 }
 
@@ -166,11 +177,25 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 	result, err := s.reconciler.Reconcile(r.Context())
 	if err != nil {
-		slog.Error("reconcile", "err", err, "applied", len(result.Actions))
+		slog.Error("reconcile", "err", err, "enqueued", len(result.Jobs))
 		writeError(w, http.StatusInternalServerError, "reconcile failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, reconcileResponse{Actions: toActions(result.Actions)})
+	writeJSON(w, http.StatusOK, reconcileResponse{Jobs: toJobs(result.Jobs)})
+}
+
+func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
+	job, err := s.queue.GetJob(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, work.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+		slog.Error("get job", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, toJob(job))
 }
 
 func (s *Server) view(ctx context.Context, item fleet.Desired) (instanceResponse, error) {
@@ -226,13 +251,17 @@ type actualResponse struct {
 }
 
 type reconcileResponse struct {
-	Actions []actionResponse `json:"actions"`
+	Jobs []jobResponse `json:"jobs"`
 }
 
-type actionResponse struct {
-	Op         string `json:"op"`
-	Name       string `json:"name"`
-	ProviderID string `json:"provider_id"`
+type jobResponse struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Op        string    `json:"op"`
+	Status    string    `json:"status"`
+	Attempts  int       `json:"attempts"`
+	LastError string    `json:"last_error"`
+	RunAfter  time.Time `json:"run_after"`
 }
 
 func toInstance(item fleet.Desired, actual *fleet.Actual) instanceResponse {
@@ -260,16 +289,24 @@ func toInstance(item fleet.Desired, actual *fleet.Actual) instanceResponse {
 	return resp
 }
 
-func toActions(actions []fleet.Action) []actionResponse {
-	out := make([]actionResponse, 0, len(actions))
-	for _, action := range actions {
-		out = append(out, actionResponse{
-			Op:         action.Op,
-			Name:       action.Name,
-			ProviderID: action.ProviderID,
-		})
+func toJobs(jobs []work.Job) []jobResponse {
+	out := make([]jobResponse, 0, len(jobs))
+	for _, job := range jobs {
+		out = append(out, toJob(job))
 	}
 	return out
+}
+
+func toJob(job work.Job) jobResponse {
+	return jobResponse{
+		ID:        job.ID,
+		Name:      job.Name,
+		Op:        job.Op,
+		Status:    job.Status,
+		Attempts:  job.Attempts,
+		LastError: job.LastError,
+		RunAfter:  job.RunAfter,
+	}
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
